@@ -1,118 +1,276 @@
+"""
+Prediction layer for the AI Swing Stock Analyzer.
+
+Pipeline
+--------
+OHLCV
+  ↓
+Complete feature engineering
+  ↓
+Gradient Boosting
+  ↓
+Probability
+  ↓
+BUY / WAIT / SELL
+  ↓
+Trade plan
+"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-import math
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from src.features.engine import build_features
 from src.features.regime import market_regime
-from .classifier import SwingClassifier
+from src.models.classifier import SwingClassifier
 
 
-@dataclass
-class SwingPrediction:
-    signal: str
-    probability_up: float
-    probability_down: float
-    confidence: str
-    expected_return: float
-    entry: float
-    stop_loss: float
-    target: float
-    risk_reward: float
-    regime: str
-    indicators: dict
-    model_training_accuracy: float | None = None
-    signal_reason: str = ""
-    trend: str = ""
-    momentum: str = ""
-    volume_status: str = ""
+# ============================================================
+# HELPERS
+# ============================================================
+
+def _get_close(
+    df: pd.DataFrame,
+) -> float:
+    """Return the latest close price."""
+
+    if "close" in df.columns:
+
+        value = df["close"]
+
+        if isinstance(
+            value,
+            pd.DataFrame,
+        ):
+            value = value.iloc[:, 0]
+
+        series = pd.to_numeric(
+            value,
+            errors="coerce",
+        )
+
+        if not series.dropna().empty:
+            return float(
+                series.dropna().iloc[-1]
+            )
+
+    # Case-insensitive fallback.
+    for column in df.columns:
+
+        if str(column).strip().lower() in {
+            "close",
+            "close_price",
+            "adj close",
+            "adj_close",
+        }:
+
+            value = df[column]
+
+            if isinstance(
+                value,
+                pd.DataFrame,
+            ):
+                value = value.iloc[:, 0]
+
+            series = pd.to_numeric(
+                value,
+                errors="coerce",
+            )
+
+            if not series.dropna().empty:
+                return float(
+                    series.dropna().iloc[-1]
+                )
+
+    raise ValueError(
+        "Could not find a valid close price."
+    )
 
 
-def _safe_float(value):
-    """Convert a scalar value to float, otherwise return None."""
-    if value is None or not np.isscalar(value):
-        return None
+def _safe_float(
+    value: Any,
+    default: float = 0.0,
+) -> float:
+    """Safely convert a value to float."""
 
     try:
-        value = float(value)
-        return value if np.isfinite(value) else None
-    except (TypeError, ValueError):
-        return None
+
+        result = float(value)
+
+        if np.isfinite(result):
+            return result
+
+    except Exception:
+        pass
+
+    return default
 
 
-def _describe_trend(last):
-    close = _safe_float(last.get("close"))
-    ema20 = _safe_float(last.get("ema20"))
-    ema50 = _safe_float(last.get("ema50"))
-    ema200 = _safe_float(last.get("ema200"))
+def _latest_value(
+    df: pd.DataFrame,
+    column: str,
+    default: float = 0.0,
+) -> float:
+    """Return the latest numeric value of a column."""
 
-    if close is None or ema20 is None or ema50 is None:
-        return "UNKNOWN"
+    if column not in df.columns:
+        return default
 
-    if ema200 is not None and close > ema20 > ema50 > ema200:
-        return "STRONG BULLISH"
+    value = df[column]
 
-    if ema200 is not None and close < ema20 < ema50 < ema200:
-        return "STRONG BEARISH"
+    if isinstance(
+        value,
+        pd.DataFrame,
+    ):
+        value = value.iloc[:, 0]
 
-    if close > ema20 and close > ema50:
-        return "BULLISH"
+    series = pd.to_numeric(
+        value,
+        errors="coerce",
+    ).dropna()
 
-    if close < ema20 and close < ema50:
-        return "BEARISH"
+    if series.empty:
+        return default
 
-    return "MIXED"
-
-
-def _describe_momentum(last):
-    rsi = _safe_float(last.get("rsi14"))
-    macd = _safe_float(last.get("macd"))
-    macd_signal = _safe_float(last.get("macd_signal"))
-
-    if rsi is None:
-        return "UNKNOWN"
-
-    if rsi >= 70:
-        return "OVERBOUGHT"
-
-    if rsi <= 30:
-        return "OVERSOLD"
-
-    if macd is not None and macd_signal is not None:
-        if rsi >= 55 and macd > macd_signal:
-            return "BULLISH"
-        if rsi <= 45 and macd < macd_signal:
-            return "BEARISH"
-
-    if rsi > 50:
-        return "MILDLY BULLISH"
-
-    if rsi < 50:
-        return "MILDLY BEARISH"
-
-    return "NEUTRAL"
+    return _safe_float(
+        series.iloc[-1],
+        default,
+    )
 
 
-def _describe_volume(last):
-    relative_volume = _safe_float(last.get("relative_volume"))
+# ============================================================
+# SIGNAL LOGIC
+# ============================================================
 
-    if relative_volume is None:
-        return "UNKNOWN"
+def _generate_signal(
+    probability: float,
+    regime: str,
+    alignment: float,
+    threshold: float,
+) -> str:
+    """
+    Convert model probability and market context into
+    BUY / WAIT / SELL.
 
-    if relative_volume >= 1.5:
-        return "STRONG"
+    The model probability is the primary signal.
 
-    if relative_volume >= 1.0:
-        return "ABOVE AVERAGE"
+    Higher-timeframe alignment is used as a confirmation
+    filter rather than replacing the ML prediction.
+    """
 
-    if relative_volume >= 0.75:
-        return "NORMAL"
+    # Strong bearish environment.
+    if (
+        regime in {
+            "STRONG BEAR",
+            "BEAR",
+        }
+        and probability < threshold
+    ):
+        return "SELL"
 
-    return "LOW"
+    # Strong bullish probability.
+    if probability >= threshold:
 
+        # If higher timeframes strongly disagree,
+        # avoid forcing a BUY.
+        if alignment < 0:
+            return "WAIT"
+
+        return "BUY"
+
+    # Very low bullish probability.
+    if probability <= (
+        1.0 - threshold
+    ):
+
+        if alignment > 0:
+            return "WAIT"
+
+        return "SELL"
+
+    return "WAIT"
+
+
+# ============================================================
+# TRADE PLAN
+# ============================================================
+
+def _trade_plan(
+    price: float,
+    signal: str,
+    stop_loss_pct: float,
+    target_pct: float,
+) -> dict[str, Any]:
+    """Generate a simple long/short trade plan."""
+
+    price = max(
+        float(price),
+        0.0,
+    )
+
+    if signal == "BUY":
+
+        stop_loss = (
+            price
+            * (1.0 - stop_loss_pct)
+        )
+
+        target = (
+            price
+            * (1.0 + target_pct)
+        )
+
+        return {
+            "entry": price,
+            "stop_loss": stop_loss,
+            "target": target,
+            "risk_pct": (
+                stop_loss_pct * 100.0
+            ),
+            "reward_pct": (
+                target_pct * 100.0
+            ),
+        }
+
+    if signal == "SELL":
+
+        stop_loss = (
+            price
+            * (1.0 + stop_loss_pct)
+        )
+
+        target = (
+            price
+            * (1.0 - target_pct)
+        )
+
+        return {
+            "entry": price,
+            "stop_loss": stop_loss,
+            "target": target,
+            "risk_pct": (
+                stop_loss_pct * 100.0
+            ),
+            "reward_pct": (
+                target_pct * 100.0
+            ),
+        }
+
+    return {
+        "entry": price,
+        "stop_loss": None,
+        "target": None,
+        "risk_pct": 0.0,
+        "reward_pct": 0.0,
+    }
+
+
+# ============================================================
+# MAIN ANALYZER
+# ============================================================
 
 def analyze_stock(
     df: pd.DataFrame,
@@ -120,151 +278,418 @@ def analyze_stock(
     probability_threshold: float = 0.60,
     stop_loss_pct: float = 0.03,
     target_pct: float = 0.06,
-) -> SwingPrediction:
+    min_train_samples: int = 30,
+) -> dict[str, Any]:
     """
-    Analyze the latest market candle using technical features
-    and the Gradient Boosting classifier.
+    Analyze a stock and generate an ML-based swing signal.
 
-    The model probability is combined with simple trend, momentum,
-    and volume diagnostics to make the signal easier to understand.
+    Parameters
+    ----------
+    df:
+        OHLCV market data.
+
+    horizon:
+        Prediction horizon in trading days.
+
+    probability_threshold:
+        Probability required for a directional signal.
+
+    stop_loss_pct:
+        Internal stop-loss percentage.
+
+    target_pct:
+        Internal target percentage.
+
+    min_train_samples:
+        Minimum number of samples required for model training.
+
+    Returns
+    -------
+    dict
+        Prediction, probability, regime and trade-plan information.
     """
-    if df is None or df.empty:
-        raise ValueError("No market data was supplied for analysis.")
 
-    if stop_loss_pct <= 0:
-        raise ValueError("Stop loss percentage must be greater than zero.")
+    # --------------------------------------------------------
+    # Validation
+    # --------------------------------------------------------
 
-    if target_pct <= 0:
-        raise ValueError("Target percentage must be greater than zero.")
+    if not isinstance(
+        df,
+        pd.DataFrame,
+    ):
+        raise TypeError(
+            "df must be a pandas DataFrame."
+        )
 
-    features = build_features(df)
+    if df.empty:
+        raise ValueError(
+            "No market data available."
+        )
+
+    horizon = int(
+        horizon
+    )
+
+    if horizon < 1:
+        raise ValueError(
+            "horizon must be at least 1."
+        )
+
+    probability_threshold = float(
+        probability_threshold
+    )
+
+    if not (
+        0.50
+        <= probability_threshold
+        <= 1.0
+    ):
+        raise ValueError(
+            "probability_threshold must be between 0.50 and 1.0."
+        )
+
+    # --------------------------------------------------------
+    # Build complete feature set.
+    # --------------------------------------------------------
+
+    features = build_features(
+        df
+    )
 
     if features.empty:
-        raise ValueError("Unable to generate technical indicators from the data.")
+        raise ValueError(
+            "Feature engineering produced no usable data."
+        )
+
+    # --------------------------------------------------------
+    # Remove infinities.
+    # --------------------------------------------------------
+
+    features = features.replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+
+    # --------------------------------------------------------
+    # Train the classifier.
+    #
+    # The classifier internally creates the future target.
+    # --------------------------------------------------------
 
     model = SwingClassifier(
         horizon=horizon,
-        probability_threshold=probability_threshold,
+        probability_threshold=(
+            probability_threshold
+        ),
+        random_state=42,
+        min_samples=min_train_samples,
     )
 
-    model.fit(features)
+    model.fit(
+        features
+    )
 
-    probabilities = model.predict_proba(features)
-    if probabilities.ndim != 2 or probabilities.shape[0] == 0:
-        raise ValueError("Model did not return valid prediction probabilities.")
+    # --------------------------------------------------------
+    # Latest prediction.
+    # --------------------------------------------------------
 
-    latest_probability = probabilities[-1]
-    p_up = float(latest_probability[1])
-    p_up = min(max(p_up, 0.0), 1.0)
-    p_down = 1.0 - p_up
+    probability_array = (
+        model.predict_proba(
+            features
+        )
+    )
 
-    last = features.iloc[-1]
+    probability_array = np.asarray(
+        probability_array,
+        dtype=float,
+    )
 
-    close = _safe_float(last.get("close"))
+    if (
+        probability_array.ndim == 2
+        and probability_array.shape[1] >= 2
+    ):
 
-    if close is None or close <= 0:
-        raise ValueError("Latest closing price is unavailable.")
-
-    trend = _describe_trend(last)
-    momentum = _describe_momentum(last)
-    volume_status = _describe_volume(last)
-    regime = market_regime(last)
-
-    # The probability is the primary decision variable.
-    # Technical diagnostics are reported separately so the user can
-    # understand whether the AI signal agrees with the market structure.
-    if p_up >= probability_threshold and p_up > p_down:
-        signal = "BUY"
-        entry = close
-        stop = close * (1.0 - stop_loss_pct)
-        target = close * (1.0 + target_pct)
-
-        signal_reason = (
-            f"AI estimates {p_up:.1%} probability of an upward move "
-            f"over the next {horizon} trading day(s)."
+        p_down = float(
+            probability_array[
+                -1,
+                0,
+            ]
         )
 
-    elif p_down >= probability_threshold and p_down > p_up:
-        signal = "SELL"
-        entry = close
-        stop = close * (1.0 + stop_loss_pct)
-        target = close * (1.0 - target_pct)
+        p_up = float(
+            probability_array[
+                -1,
+                1,
+            ]
+        )
 
-        signal_reason = (
-            f"AI estimates {p_down:.1%} probability of a downward move "
-            f"over the next {horizon} trading day(s)."
+    elif probability_array.ndim == 1:
+
+        p_up = float(
+            probability_array[-1]
+        )
+
+        p_down = (
+            1.0 - p_up
         )
 
     else:
-        signal = "WAIT"
-        entry = close
-        stop = close
-        target = close
 
-        strongest_probability = max(p_up, p_down)
+        p_up = 0.5
+        p_down = 0.5
 
-        signal_reason = (
-            f"Neither direction reached the {probability_threshold:.0%} "
-            f"AI probability threshold. Strongest probability: "
-            f"{strongest_probability:.1%}."
+    p_up = float(
+        np.clip(
+            p_up,
+            0.0,
+            1.0,
         )
-
-    risk_reward = (
-        target_pct / stop_loss_pct
-        if stop_loss_pct > 0
-        else math.inf
     )
 
-    strongest_probability = max(p_up, p_down)
+    p_down = float(
+        np.clip(
+            p_down,
+            0.0,
+            1.0,
+        )
+    )
 
-    if strongest_probability >= 0.70:
-        confidence = "HIGH"
-    elif strongest_probability >= probability_threshold:
-        confidence = "MEDIUM"
-    else:
-        confidence = "LOW"
+    # --------------------------------------------------------
+    # Market regime.
+    # --------------------------------------------------------
 
-    indicator_names = [
-        "rsi14",
-        "adx",
-        "atr14",
-        "macd",
-        "macd_signal",
-        "macd_hist",
-        "relative_volume",
-        "ema20",
-        "ema50",
-        "ema200",
-        "bb_upper",
-        "bb_lower",
-        "roc10",
-        "obv",
-        "volatility20",
-    ]
+    try:
+
+        regime = market_regime(
+            features
+        )
+
+    except Exception:
+
+        regime = "UNKNOWN"
+
+    # --------------------------------------------------------
+    # Multi-timeframe context.
+    # --------------------------------------------------------
+
+    weekly_trend = _latest_value(
+        features,
+        "weekly_trend",
+        0.0,
+    )
+
+    monthly_trend = _latest_value(
+        features,
+        "monthly_trend",
+        0.0,
+    )
+
+    higher_timeframe_score = _latest_value(
+        features,
+        "higher_timeframe_score",
+        0.0,
+    )
+
+    alignment = _latest_value(
+        features,
+        "three_timeframe_alignment",
+        0.0,
+    )
+
+    # --------------------------------------------------------
+    # Signal.
+    # --------------------------------------------------------
+
+    signal = _generate_signal(
+        probability=p_up,
+        regime=regime,
+        alignment=alignment,
+        threshold=probability_threshold,
+    )
+
+    # --------------------------------------------------------
+    # Current price.
+    # --------------------------------------------------------
+
+    price = _get_close(
+        features
+    )
+
+    # --------------------------------------------------------
+    # Trade plan.
+    # --------------------------------------------------------
+
+    plan = _trade_plan(
+        price=price,
+        signal=signal,
+        stop_loss_pct=stop_loss_pct,
+        target_pct=target_pct,
+    )
+
+    # --------------------------------------------------------
+    # Additional indicators.
+    # --------------------------------------------------------
 
     indicators = {
-        name: _safe_float(last.get(name))
-        for name in indicator_names
+        "rsi": _latest_value(
+            features,
+            "rsi14",
+            _latest_value(
+                features,
+                "rsi",
+                0.0,
+            ),
+        ),
+        "macd": _latest_value(
+            features,
+            "macd",
+            0.0,
+        ),
+        "atr_pct": _latest_value(
+            features,
+            "atr_pct",
+            0.0,
+        ),
+        "relative_volume": _latest_value(
+            features,
+            "relative_volume",
+            _latest_value(
+                features,
+                "volume_ratio",
+                0.0,
+            ),
+        ),
+        "adx": _latest_value(
+            features,
+            "adx",
+            0.0,
+        ),
+        "ema20": _latest_value(
+            features,
+            "ema20",
+            0.0,
+        ),
+        "ema50": _latest_value(
+            features,
+            "ema50",
+            0.0,
+        ),
+        "ema200": _latest_value(
+            features,
+            "ema200",
+            0.0,
+        ),
     }
 
-    expected_return = (p_up - p_down) * 0.05
+    # --------------------------------------------------------
+    # Feature importance.
+    # --------------------------------------------------------
 
-    return SwingPrediction(
-        signal=signal,
-        probability_up=p_up,
-        probability_down=p_down,
-        confidence=confidence,
-        expected_return=expected_return,
-        entry=entry,
-        stop_loss=stop,
-        target=target,
-        risk_reward=risk_reward,
-        regime=regime,
-        indicators=indicators,
-        model_training_accuracy=None,
-        signal_reason=signal_reason,
-        trend=trend,
-        momentum=momentum,
-        volume_status=volume_status,
-    )
-    
+    try:
+
+        importance_df = (
+            model.feature_importance()
+        )
+
+        top_features = (
+            importance_df
+            .head(10)
+            .to_dict(
+                orient="records"
+            )
+        )
+
+    except Exception:
+
+        importance_df = pd.DataFrame()
+
+        top_features = []
+
+    # --------------------------------------------------------
+    # Model summary.
+    # --------------------------------------------------------
+
+    try:
+
+        training_accuracy = (
+            model.training_accuracy
+        )
+
+    except Exception:
+
+        training_accuracy = None
+
+    # --------------------------------------------------------
+    # Result.
+    # --------------------------------------------------------
+
+    return {
+        "signal": signal,
+
+        "probability_up": p_up,
+
+        "probability_down": p_down,
+
+        "prediction_probability": p_up,
+
+        "horizon": horizon,
+
+        "current_price": price,
+
+        "regime": regime,
+
+        "weekly_trend": weekly_trend,
+
+        "monthly_trend": monthly_trend,
+
+        "higher_timeframe_score": (
+            higher_timeframe_score
+        ),
+
+        "three_timeframe_alignment": (
+            alignment
+        ),
+
+        "trade_plan": plan,
+
+        "entry": plan["entry"],
+
+        "stop_loss": plan["stop_loss"],
+
+        "target": plan["target"],
+
+        "indicators": indicators,
+
+        "top_features": top_features,
+
+        "feature_importance": (
+            importance_df
+        ),
+
+        "model_training_accuracy": (
+            training_accuracy
+        ),
+
+        "n_rows": len(features),
+
+        "n_features": len(
+            model.feature_names_
+        ),
+
+        "features": features,
+
+        "model": model,
+    }
+
+
+# ============================================================
+# BACKWARD-COMPATIBLE ALIASES
+# ============================================================
+
+predict_stock = analyze_stock
+
+
+__all__ = [
+    "analyze_stock",
+    "predict_stock",
+]
