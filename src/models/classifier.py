@@ -161,3 +161,9 @@ class GradientBoostingSwingClassifier:
 
         prediction = int(up_probability >= down_probability)
         return prediction, up_probability
+
+
+# Backward-compatible public name used by the existing application.
+SwingClassifier = GradientBoostingSwingClassifier
+
+__all__ = ["GradientBoostingSwingClassifier", "SwingClassifier"]
