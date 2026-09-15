@@ -1,5 +1,13 @@
-from .classifier import SwingClassifier
-from .predictor import SwingPrediction, analyze_stock
-from .backtest import run_backtest
+"""
+Model package exports.
 
-__all__ = ["SwingClassifier", "SwingPrediction", "analyze_stock", "run_backtest"]
+Keep the public SwingClassifier name for backward compatibility with
+existing imports while using the Gradient Boosting implementation.
+"""
+
+from .classifier import GradientBoostingSwingClassifier
+
+# Backward-compatible name used by the existing application.
+SwingClassifier = GradientBoostingSwingClassifier
+
+__all__ = ["SwingClassifier", "GradientBoostingSwingClassifier"]
