@@ -1,189 +1,3 @@
-
-Today 6:30 PM
-
-AI-Swing-Analyser-UPDATED(1).zip
-Zip Archive
-go through it
-
-
-Swing-Analyzer-main.zip
-Zip Archive
-
-
-Swing-Analyzer-Simple(1).zip
-Zip Archive
-
-
-Analyzed
-Next file: src/features/price_action.py
-
-This is a substantial upgrade. It adds:
-
-Candle anatomy and wick features
-
-Bullish/bearish/doji detection
-
-Gap and multi-day returns
-
-Support/resistance
-
-Leakage-safe breakout/breakdown features
-
-Higher-high / higher-low market structure
-
-ATR-normalized price movement
-
-Bullish/bearish streaks
-
-Structure scores
-
-Replace your existing file with this:
-
-Download price_action.py
-
-Test the app after replacing it. If everything works, say “next” and we'll move to volume.py. 
-
-
-price_action.py
-Code
-
-
-Missing required columns: ['Close', 'High', 'Low', 'Open']  
-
-
-Analyzed
-Yes — this is a column-format compatibility issue, not a problem with the price-action calculations.
-
-The new version was expecting exact Open/High/Low/Close, while your pipeline is likely passing lowercase or Yahoo-style flattened columns.
-
-Replace your current src/features/price_action.py with this fixed version:
-
-Download price_action_FIXED.py
-
-What I fixed
-It now automatically recognizes:
-
-Open / High / Low / Close
-
-open / high / low / close
-
-Adj Close
-
-Yahoo-style flattened names such as Close_RELIANCE.NS
-
-Simple MultiIndex columns
-
-It also gives you the available column names in the error message if something unexpected reaches the function.
-
-Replace only this file and run the app again. If it works, say “next”. 
-
-
-price_action_FIXED.py
-Code
-
-
-'volume'
-
-
-Analyzed
-That 'volume' error is coming from volume.py.
-
-Replace only src/features/volume.py with:
-
-Download volume_FIXED.py
-
-Fixed
-Handles Volume, volume, Vol
-
-Handles Yahoo-style column names
-
-Handles missing volume without crashing
-
-Adds relative volume
-
-Volume spikes
-
-Volume trend/slope
-
-OBV
-
-Price-volume confirmation
-
-Bullish/bearish volume signals
-
-Run the app again.
-
-If it works, say “next”. 
-
-
-volume_FIXED.py
-Code
-
-
-Library
-/
-volume_FIXED.py
-
-
-1
-2
-3
-4
-5
-6
-7
-8
-9
-10
-11
-12
-13
-14
-15
-16
-17
-18
-19
-20
-21
-22
-23
-24
-25
-26
-27
-28
-29
-30
-31
-32
-33
-34
-35
-36
-37
-38
-39
-40
-41
-42
-43
-44
-45
-46
-47
-48
-49
-50
-51
-52
-53
-54
-55
-56
-57
-58
-59
 """
 Robust volume feature engineering for the Swing Analyzer.
 """
@@ -243,3 +57,55 @@ def add_volume_features(df: pd.DataFrame) -> pd.DataFrame:
     out["Volume_SMA5"] = volume.rolling(5, min_periods=1).mean()
     out["Volume_SMA10"] = volume.rolling(10, min_periods=1).mean()
     out["Volume_SMA20"] = volume.rolling(20, min_periods=1).mean()
+    out["Volume_SMA50"] = volume.rolling(50, min_periods=1).mean()
+
+    out["Volume_Change_Pct"] = volume.pct_change() * 100
+    out["Volume_ROC5"] = volume.pct_change(5) * 100
+    out["Volume_ROC20"] = volume.pct_change(20) * 100
+
+    # Relative volume against recent average.
+    out["Relative_Volume_5"] = (
+        volume / out["Volume_SMA5"].replace(0, np.nan)
+    )
+    out["Relative_Volume_20"] = (
+        volume / out["Volume_SMA20"].replace(0, np.nan)
+    )
+
+    # Volume trend
+    out["Volume_Slope_10"] = (
+        out["Volume_SMA10"] - out["Volume_SMA10"].shift(5)
+    )
+    out["Volume_Slope_20"] = (
+        out["Volume_SMA20"] - out["Volume_SMA20"].shift(10)
+    )
+
+    # Price-volume confirmation
+    price_return = close.pct_change()
+    out["Price_Return"] = price_return
+    out["Price_Volume_Sign"] = np.sign(price_return) * np.sign(
+        out["Volume_Change_Pct"]
+    )
+
+    out["Bullish_Volume"] = (
+        (price_return > 0) & (out["Relative_Volume_20"] > 1.0)
+    ).astype(int)
+
+    out["Bearish_Volume"] = (
+        (price_return < 0) & (out["Relative_Volume_20"] > 1.0)
+    ).astype(int)
+
+    # OBV
+    direction = np.sign(close.diff()).fillna(0)
+    out["OBV"] = (direction * volume.fillna(0)).cumsum()
+    out["OBV_SMA20"] = out["OBV"].rolling(20, min_periods=1).mean()
+    out["OBV_Slope_10"] = out["OBV"] - out["OBV"].shift(10)
+
+    # Simple volume spike flag.
+    out["Volume_Spike"] = (
+        out["Relative_Volume_20"] >= 1.5
+    ).astype(int)
+
+    numeric_cols = out.select_dtypes(include=[np.number]).columns
+    out[numeric_cols] = out[numeric_cols].replace([np.inf, -np.inf], np.nan)
+
+    return out
