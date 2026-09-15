@@ -1,19 +1,19 @@
 """
 Prediction layer for the AI Swing Stock Analyzer.
 
-Pipeline
---------
-OHLCV
-  ↓
-Complete feature engineering
-  ↓
-Gradient Boosting
-  ↓
-Probability
-  ↓
-BUY / WAIT / SELL
-  ↓
-Trade plan
+Provides:
+    analyze_stock()
+    predict_stock()
+
+The returned PredictionResult supports BOTH:
+
+    pred.probability_up
+
+and:
+
+    pred["probability_up"]
+
+This keeps compatibility with different versions of the UI.
 """
 
 from __future__ import annotations
@@ -29,79 +29,58 @@ from src.models.classifier import SwingClassifier
 
 
 # ============================================================
-# HELPERS
+# COMPATIBLE RESULT OBJECT
 # ============================================================
 
-def _get_close(
-    df: pd.DataFrame,
-) -> float:
-    """Return the latest close price."""
+class PredictionResult(dict):
+    """
+    Dictionary with attribute-style access.
 
-    if "close" in df.columns:
+    Examples
+    --------
+    result["probability_up"]
 
-        value = df["close"]
+    result.probability_up
+    """
 
-        if isinstance(
-            value,
-            pd.DataFrame,
-        ):
-            value = value.iloc[:, 0]
+    def __getattr__(
+        self,
+        name: str,
+    ) -> Any:
 
-        series = pd.to_numeric(
-            value,
-            errors="coerce",
-        )
+        try:
+            return self[name]
 
-        if not series.dropna().empty:
-            return float(
-                series.dropna().iloc[-1]
-            )
+        except KeyError as exc:
 
-    # Case-insensitive fallback.
-    for column in df.columns:
+            raise AttributeError(
+                f"PredictionResult has no attribute '{name}'"
+            ) from exc
 
-        if str(column).strip().lower() in {
-            "close",
-            "close_price",
-            "adj close",
-            "adj_close",
-        }:
+    def __setattr__(
+        self,
+        name: str,
+        value: Any,
+    ) -> None:
 
-            value = df[column]
+        self[name] = value
 
-            if isinstance(
-                value,
-                pd.DataFrame,
-            ):
-                value = value.iloc[:, 0]
 
-            series = pd.to_numeric(
-                value,
-                errors="coerce",
-            )
-
-            if not series.dropna().empty:
-                return float(
-                    series.dropna().iloc[-1]
-                )
-
-    raise ValueError(
-        "Could not find a valid close price."
-    )
-
+# ============================================================
+# HELPERS
+# ============================================================
 
 def _safe_float(
     value: Any,
     default: float = 0.0,
 ) -> float:
-    """Safely convert a value to float."""
 
     try:
 
-        result = float(value)
+        value = float(value)
 
-        if np.isfinite(result):
-            return result
+        if np.isfinite(value):
+            return value
 
     except Exception:
         pass
@@ -114,7 +93,6 @@ def _latest_value(
     column: str,
     default: float = 0.0,
 ) -> float:
-    """Return the latest numeric value of a column."""
 
     if column not in df.columns:
         return default
@@ -141,50 +119,99 @@ def _latest_value(
     )
 
 
+def _latest_close(
+    df: pd.DataFrame,
+) -> float:
+
+    if "close" in df.columns:
+
+        value = df["close"]
+
+        if isinstance(
+            value,
+            pd.DataFrame,
+        ):
+            value = value.iloc[:, 0]
+
+        value = pd.to_numeric(
+            value,
+            errors="coerce",
+        ).dropna()
+
+        if not value.empty:
+            return float(
+                value.iloc[-1]
+            )
+
+    for column in df.columns:
+
+        name = (
+            str(column)
+            .strip()
+            .lower()
+        )
+
+        if name in {
+            "close",
+            "close_price",
+            "adj close",
+            "adj_close",
+        }:
+
+            value = df[column]
+
+            if isinstance(
+                value,
+                pd.DataFrame,
+            ):
+                value = value.iloc[:, 0]
+
+            value = pd.to_numeric(
+                value,
+                errors="coerce",
+            ).dropna()
+
+            if not value.empty:
+                return float(
+                    value.iloc[-1]
+                )
+
+    raise ValueError(
+        "Valid close price not found."
+    )
+
+
 # ============================================================
-# SIGNAL LOGIC
+# SIGNAL
 # ============================================================
 
 def _generate_signal(
-    probability: float,
+    probability_up: float,
     regime: str,
     alignment: float,
     threshold: float,
 ) -> str:
     """
-    Convert model probability and market context into
-    BUY / WAIT / SELL.
+    Generate BUY / SELL / WAIT.
 
-    The model probability is the primary signal.
-
-    Higher-timeframe alignment is used as a confirmation
-    filter rather than replacing the ML prediction.
+    ML probability is the primary signal.
+    Higher-timeframe trend is confirmation.
     """
 
-    # Strong bearish environment.
-    if (
-        regime in {
-            "STRONG BEAR",
-            "BEAR",
-        }
-        and probability < threshold
-    ):
-        return "SELL"
+    probability_down = (
+        1.0 - probability_up
+    )
 
     # Strong bullish probability.
-    if probability >= threshold:
+    if probability_up >= threshold:
 
-        # If higher timeframes strongly disagree,
-        # avoid forcing a BUY.
         if alignment < 0:
             return "WAIT"
 
         return "BUY"
 
-    # Very low bullish probability.
-    if probability <= (
-        1.0 - threshold
-    ):
+    # Strong bearish probability.
+    if probability_down >= threshold:
 
         if alignment > 0:
             return "WAIT"
@@ -198,18 +225,14 @@ def _generate_signal(
 # TRADE PLAN
 # ============================================================
 
-def _trade_plan(
+def _create_trade_plan(
     price: float,
     signal: str,
     stop_loss_pct: float,
     target_pct: float,
 ) -> dict[str, Any]:
-    """Generate a simple long/short trade plan."""
 
-    price = max(
-        float(price),
-        0.0,
-    )
+    price = float(price)
 
     if signal == "BUY":
 
@@ -223,19 +246,7 @@ def _trade_plan(
             * (1.0 + target_pct)
         )
 
-        return {
-            "entry": price,
-            "stop_loss": stop_loss,
-            "target": target,
-            "risk_pct": (
-                stop_loss_pct * 100.0
-            ),
-            "reward_pct": (
-                target_pct * 100.0
-            ),
-        }
-
-    if signal == "SELL":
+    elif signal == "SELL":
 
         stop_loss = (
             price
@@ -247,29 +258,30 @@ def _trade_plan(
             * (1.0 - target_pct)
         )
 
-        return {
-            "entry": price,
-            "stop_loss": stop_loss,
-            "target": target,
-            "risk_pct": (
-                stop_loss_pct * 100.0
-            ),
-            "reward_pct": (
-                target_pct * 100.0
-            ),
-        }
+    else:
+
+        stop_loss = None
+        target = None
 
     return {
         "entry": price,
-        "stop_loss": None,
-        "target": None,
-        "risk_pct": 0.0,
-        "reward_pct": 0.0,
+        "stop_loss": stop_loss,
+        "target": target,
+        "risk_pct": (
+            stop_loss_pct * 100.0
+            if signal != "WAIT"
+            else 0.0
+        ),
+        "reward_pct": (
+            target_pct * 100.0
+            if signal != "WAIT"
+            else 0.0
+        ),
     }
 
 
 # ============================================================
-# MAIN ANALYZER
+# MAIN ANALYSIS
 # ============================================================
 
 def analyze_stock(
@@ -279,39 +291,7 @@ def analyze_stock(
     stop_loss_pct: float = 0.03,
     target_pct: float = 0.06,
     min_train_samples: int = 30,
-) -> dict[str, Any]:
-    """
-    Analyze a stock and generate an ML-based swing signal.
-
-    Parameters
-    ----------
-    df:
-        OHLCV market data.
-
-    horizon:
-        Prediction horizon in trading days.
-
-    probability_threshold:
-        Probability required for a directional signal.
-
-    stop_loss_pct:
-        Internal stop-loss percentage.
-
-    target_pct:
-        Internal target percentage.
-
-    min_train_samples:
-        Minimum number of samples required for model training.
-
-    Returns
-    -------
-    dict
-        Prediction, probability, regime and trade-plan information.
-    """
-
-    # --------------------------------------------------------
-    # Validation
-    # --------------------------------------------------------
+) -> PredictionResult:
 
     if not isinstance(
         df,
@@ -326,9 +306,7 @@ def analyze_stock(
             "No market data available."
         )
 
-    horizon = int(
-        horizon
-    )
+    horizon = int(horizon)
 
     if horizon < 1:
         raise ValueError(
@@ -345,11 +323,12 @@ def analyze_stock(
         <= 1.0
     ):
         raise ValueError(
-            "probability_threshold must be between 0.50 and 1.0."
+            "Probability threshold must be between "
+            "0.50 and 1.00."
         )
 
     # --------------------------------------------------------
-    # Build complete feature set.
+    # COMPLETE FEATURE PIPELINE
     # --------------------------------------------------------
 
     features = build_features(
@@ -358,12 +337,8 @@ def analyze_stock(
 
     if features.empty:
         raise ValueError(
-            "Feature engineering produced no usable data."
+            "Feature engineering produced no data."
         )
-
-    # --------------------------------------------------------
-    # Remove infinities.
-    # --------------------------------------------------------
 
     features = features.replace(
         [np.inf, -np.inf],
@@ -371,9 +346,7 @@ def analyze_stock(
     )
 
     # --------------------------------------------------------
-    # Train the classifier.
-    #
-    # The classifier internally creates the future target.
+    # MODEL
     # --------------------------------------------------------
 
     model = SwingClassifier(
@@ -390,72 +363,64 @@ def analyze_stock(
     )
 
     # --------------------------------------------------------
-    # Latest prediction.
+    # PROBABILITY
     # --------------------------------------------------------
 
-    probability_array = (
-        model.predict_proba(
-            features
-        )
+    probabilities = model.predict_proba(
+        features
     )
 
-    probability_array = np.asarray(
-        probability_array,
+    probabilities = np.asarray(
+        probabilities,
         dtype=float,
     )
 
     if (
-        probability_array.ndim == 2
-        and probability_array.shape[1] >= 2
+        probabilities.ndim == 2
+        and probabilities.shape[1] >= 2
     ):
 
-        p_down = float(
-            probability_array[
-                -1,
-                0,
-            ]
+        probability_down = float(
+            probabilities[-1, 0]
         )
 
-        p_up = float(
-            probability_array[
-                -1,
-                1,
-            ]
+        probability_up = float(
+            probabilities[-1, 1]
         )
 
-    elif probability_array.ndim == 1:
+    elif probabilities.ndim == 1:
 
-        p_up = float(
-            probability_array[-1]
+        probability_up = float(
+            probabilities[-1]
         )
 
-        p_down = (
-            1.0 - p_up
+        probability_down = (
+            1.0 - probability_up
         )
 
     else:
 
-        p_up = 0.5
-        p_down = 0.5
+        probability_up = 0.5
+        probability_down = 0.5
 
-    p_up = float(
+    probability_up = float(
         np.clip(
-            p_up,
+            probability_up,
             0.0,
             1.0,
         )
     )
 
-    p_down = float(
+    probability_down = float(
         np.clip(
-            p_down,
+            probability_down,
             0.0,
             1.0,
         )
     )
 
     # --------------------------------------------------------
-    # Market regime.
+    # REGIME
     # --------------------------------------------------------
 
     try:
@@ -469,7 +434,7 @@ def analyze_stock(
         regime = "UNKNOWN"
 
     # --------------------------------------------------------
-    # Multi-timeframe context.
+    # MULTI-TIMEFRAME CONTEXT
     # --------------------------------------------------------
 
     weekly_trend = _latest_value(
@@ -497,92 +462,110 @@ def analyze_stock(
     )
 
     # --------------------------------------------------------
-    # Signal.
+    # SIGNAL
     # --------------------------------------------------------
 
     signal = _generate_signal(
-        probability=p_up,
+        probability_up=probability_up,
         regime=regime,
         alignment=alignment,
         threshold=probability_threshold,
     )
 
     # --------------------------------------------------------
-    # Current price.
+    # PRICE
     # --------------------------------------------------------
 
-    price = _get_close(
+    current_price = _latest_close(
         features
     )
 
     # --------------------------------------------------------
-    # Trade plan.
+    # TRADE PLAN
     # --------------------------------------------------------
 
-    plan = _trade_plan(
-        price=price,
+    trade_plan = _create_trade_plan(
+        price=current_price,
         signal=signal,
         stop_loss_pct=stop_loss_pct,
         target_pct=target_pct,
     )
 
     # --------------------------------------------------------
-    # Additional indicators.
+    # INDICATORS
     # --------------------------------------------------------
 
+    rsi = _latest_value(
+        features,
+        "rsi14",
+        _latest_value(
+            features,
+            "rsi",
+            0.0,
+        ),
+    )
+
+    macd = _latest_value(
+        features,
+        "macd",
+        0.0,
+    )
+
+    atr_pct = _latest_value(
+        features,
+        "atr_pct",
+        0.0,
+    )
+
+    relative_volume = _latest_value(
+        features,
+        "relative_volume",
+        _latest_value(
+            features,
+            "volume_ratio",
+            0.0,
+        ),
+    )
+
+    adx = _latest_value(
+        features,
+        "adx",
+        0.0,
+    )
+
+    ema20 = _latest_value(
+        features,
+        "ema20",
+        0.0,
+    )
+
+    ema50 = _latest_value(
+        features,
+        "ema50",
+        0.0,
+    )
+
+    ema200 = _latest_value(
+        features,
+        "ema200",
+        0.0,
+    )
+
     indicators = {
-        "rsi": _latest_value(
-            features,
-            "rsi14",
-            _latest_value(
-                features,
-                "rsi",
-                0.0,
-            ),
-        ),
-        "macd": _latest_value(
-            features,
-            "macd",
-            0.0,
-        ),
-        "atr_pct": _latest_value(
-            features,
-            "atr_pct",
-            0.0,
-        ),
-        "relative_volume": _latest_value(
-            features,
-            "relative_volume",
-            _latest_value(
-                features,
-                "volume_ratio",
-                0.0,
-            ),
-        ),
-        "adx": _latest_value(
-            features,
-            "adx",
-            0.0,
-        ),
-        "ema20": _latest_value(
-            features,
-            "ema20",
-            0.0,
-        ),
-        "ema50": _latest_value(
-            features,
-            "ema50",
-            0.0,
-        ),
-        "ema200": _latest_value(
-            features,
-            "ema200",
-            0.0,
-        ),
+        "rsi": rsi,
+        "rsi14": rsi,
+        "macd": macd,
+        "atr_pct": atr_pct,
+        "relative_volume": relative_volume,
+        "volume_ratio": relative_volume,
+        "adx": adx,
+        "ema20": ema20,
+        "ema50": ema50,
+        "ema200": ema200,
     }
 
     # --------------------------------------------------------
-    # Feature importance.
+    # FEATURE IMPORTANCE
     # --------------------------------------------------------
 
     try:
@@ -606,90 +589,124 @@ def analyze_stock(
         top_features = []
 
     # --------------------------------------------------------
-    # Model summary.
+    # TRAINING ACCURACY
     # --------------------------------------------------------
 
-    try:
-
-        training_accuracy = (
-            model.training_accuracy
-        )
-
-    except Exception:
-
-        training_accuracy = None
+    training_accuracy = getattr(
+        model,
+        "training_accuracy",
+        None,
+    )
 
     # --------------------------------------------------------
-    # Result.
+    # RESULT OBJECT
     # --------------------------------------------------------
 
-    return {
-        "signal": signal,
+    result = PredictionResult()
 
-        "probability_up": p_up,
+    # Core fields.
+    result.signal = signal
 
-        "probability_down": p_down,
+    result.probability_up = (
+        probability_up
+    )
 
-        "prediction_probability": p_up,
+    result.probability_down = (
+        probability_down
+    )
 
-        "horizon": horizon,
+    result.prediction_probability = (
+        probability_up
+    )
 
-        "current_price": price,
+    result.horizon = horizon
 
-        "regime": regime,
+    result.current_price = (
+        current_price
+    )
 
-        "weekly_trend": weekly_trend,
+    result.price = current_price
 
-        "monthly_trend": monthly_trend,
+    result.regime = regime
 
-        "higher_timeframe_score": (
-            higher_timeframe_score
-        ),
+    # Multi-timeframe.
+    result.weekly_trend = (
+        weekly_trend
+    )
 
-        "three_timeframe_alignment": (
-            alignment
-        ),
+    result.monthly_trend = (
+        monthly_trend
+    )
 
-        "trade_plan": plan,
+    result.higher_timeframe_score = (
+        higher_timeframe_score
+    )
 
-        "entry": plan["entry"],
+    result.three_timeframe_alignment = (
+        alignment
+    )
 
-        "stop_loss": plan["stop_loss"],
+    # Trade plan.
+    result.trade_plan = trade_plan
 
-        "target": plan["target"],
+    result.entry = trade_plan[
+        "entry"
+    ]
 
-        "indicators": indicators,
+    result.stop_loss = trade_plan[
+        "stop_loss"
+    ]
 
-        "top_features": top_features,
+    result.target = trade_plan[
+        "target"
+    ]
 
-        "feature_importance": (
-            importance_df
-        ),
+    # Indicators.
+    result.indicators = indicators
 
-        "model_training_accuracy": (
-            training_accuracy
-        ),
+    # ML information.
+    result.top_features = (
+        top_features
+    )
 
-        "n_rows": len(features),
+    result.feature_importance = (
+        importance_df
+    )
 
-        "n_features": len(
-            model.feature_names_
-        ),
+    result.model_training_accuracy = (
+        training_accuracy
+    )
 
-        "features": features,
+    result.training_accuracy = (
+        training_accuracy
+    )
 
-        "model": model,
-    }
+    result.n_rows = len(
+        features
+    )
+
+    result.n_features = len(
+        model.feature_names_
+    )
+
+    # Full feature data.
+    result.features = features
+
+    # Model.
+    result.model = model
+
+    return result
 
 
 # ============================================================
-# BACKWARD-COMPATIBLE ALIASES
+# BACKWARD COMPATIBILITY
 # ============================================================
 
 predict_stock = analyze_stock
 
 
 __all__ = [
+    "PredictionResult",
     "analyze_stock",
     "predict_stock",
-]
+  ]
