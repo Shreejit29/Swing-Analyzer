@@ -147,9 +147,14 @@ def analyze_stock(
         probability_threshold=probability_threshold,
     )
 
-    model.fit(df)
+    model.fit(features)
 
-    p_up = float(model.predict_proba(df))
+    probabilities = model.predict_proba(features)
+    if probabilities.ndim != 2 or probabilities.shape[0] == 0:
+        raise ValueError("Model did not return valid prediction probabilities.")
+
+    latest_probability = probabilities[-1]
+    p_up = float(latest_probability[1])
     p_up = min(max(p_up, 0.0), 1.0)
     p_down = 1.0 - p_up
 
@@ -221,7 +226,7 @@ def analyze_stock(
 
     indicator_names = [
         "rsi14",
-        "adx14",
+        "adx",
         "atr14",
         "macd",
         "macd_signal",
@@ -256,9 +261,10 @@ def analyze_stock(
         risk_reward=risk_reward,
         regime=regime,
         indicators=indicators,
-        model_training_accuracy=model.training_accuracy,
+        model_training_accuracy=None,
         signal_reason=signal_reason,
         trend=trend,
         momentum=momentum,
         volume_status=volume_status,
     )
+    
