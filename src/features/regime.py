@@ -1,93 +1,217 @@
+"""
+Market regime detection.
+
+Input:
+    DataFrame containing OHLCV + technical features.
+
+Output:
+    DataFrame with regime-related columns.
+
+The module is deliberately defensive because stocks may have
+insufficient history for a reliable EMA200.
+"""
+
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
 
-def _safe_value(row: pd.Series, name: str):
-    """Return a finite float or None."""
-    value = row.get(name)
+def _series(df: pd.DataFrame, name: str) -> pd.Series:
+    """Return a numeric series, case-insensitively."""
+    if name in df.columns:
+        return pd.to_numeric(df[name], errors="coerce")
 
-    if value is None or not np.isscalar(value):
-        return None
+    lookup = {str(c).lower(): c for c in df.columns}
 
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        return None
+    if name.lower() in lookup:
+        return pd.to_numeric(df[lookup[name.lower()]], errors="coerce")
 
-    if not np.isfinite(value):
-        return None
-
-    return value
+    return pd.Series(np.nan, index=df.index, dtype=float)
 
 
-def market_regime(row: pd.Series) -> str:
+def add_regime_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Classify the current market regime from trend structure and ADX.
+    Add market-regime features.
 
-    Regimes:
+    Required:
+        close
+
+    Preferred:
+        ema20, ema50, ema200
+
+    The function does not modify the input DataFrame.
+    """
+    out = df.copy()
+
+    close = _series(out, "close")
+
+    ema20 = _series(out, "ema20")
+    ema50 = _series(out, "ema50")
+    ema200 = _series(out, "ema200")
+
+    # Calculate missing EMAs from close.
+    if ema20.isna().all():
+        ema20 = close.ewm(span=20, adjust=False, min_periods=1).mean()
+
+    if ema50.isna().all():
+        ema50 = close.ewm(span=50, adjust=False, min_periods=1).mean()
+
+    if ema200.isna().all():
+        ema200 = close.ewm(span=200, adjust=False, min_periods=1).mean()
+
+    out["ema20"] = ema20
+    out["ema50"] = ema50
+    out["ema200"] = ema200
+
+    # ---------------------------------------------------------
+    # Trend relationships
+    # ---------------------------------------------------------
+    out["price_vs_ema20"] = close / ema20.replace(0, np.nan) - 1.0
+    out["price_vs_ema50"] = close / ema50.replace(0, np.nan) - 1.0
+    out["price_vs_ema200"] = close / ema200.replace(0, np.nan) - 1.0
+
+    out["ema20_vs_ema50"] = ema20 / ema50.replace(0, np.nan) - 1.0
+    out["ema50_vs_ema200"] = ema50 / ema200.replace(0, np.nan) - 1.0
+
+    # ---------------------------------------------------------
+    # EMA slopes
+    # ---------------------------------------------------------
+    out["ema20_slope"] = ema20.pct_change(5)
+    out["ema50_slope"] = ema50.pct_change(10)
+    out["ema200_slope"] = ema200.pct_change(20)
+
+    # ---------------------------------------------------------
+    # Trend score
+    #
+    # We use multiple independent conditions rather than a
+    # single indicator.
+    # ---------------------------------------------------------
+    score = pd.Series(0.0, index=out.index)
+
+    score += np.where(close > ema20, 1, -1)
+    score += np.where(ema20 > ema50, 1, -1)
+    score += np.where(ema50 > ema200, 1, -1)
+
+    score += np.where(out["ema20_slope"] > 0, 1, -1)
+    score += np.where(out["ema50_slope"] > 0, 1, -1)
+
+    out["regime_score"] = score
+
+    # ---------------------------------------------------------
+    # Volatility context
+    # ---------------------------------------------------------
+    returns = close.pct_change()
+
+    volatility = returns.rolling(20, min_periods=5).std()
+
+    out["regime_volatility"] = volatility
+    out["regime_volatility_rank"] = (
+        volatility
+        .rolling(100, min_periods=20)
+        .rank(pct=True)
+    )
+
+    # ---------------------------------------------------------
+    # Regime classification
+    #
+    # Strong trend:
+    #     score >= +4 / <= -4
+    #
+    # Normal trend:
+    #     score >= +2 / <= -2
+    #
+    # Otherwise:
+    #     SIDEWAYS
+    # ---------------------------------------------------------
+    def classify(value: float) -> str:
+        if pd.isna(value):
+            return "UNKNOWN"
+
+        if value >= 4:
+            return "STRONG BULL"
+
+        if value >= 2:
+            return "BULL"
+
+        if value <= -4:
+            return "STRONG BEAR"
+
+        if value <= -2:
+            return "BEAR"
+
+        return "SIDEWAYS"
+
+    out["regime"] = out["regime_score"].apply(classify)
+
+    # ---------------------------------------------------------
+    # Numeric trend direction
+    # Useful for ML models.
+    # ---------------------------------------------------------
+    out["regime_direction"] = out["regime_score"].apply(
+        lambda x: (
+            1
+            if pd.notna(x) and x >= 2
+            else -1
+            if pd.notna(x) and x <= -2
+            else 0
+        )
+    )
+
+    # ---------------------------------------------------------
+    # Clean numerical problems
+    # ---------------------------------------------------------
+    numeric_columns = out.select_dtypes(include=[np.number]).columns
+    out[numeric_columns] = out[numeric_columns].replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+
+    return out
+
+
+def detect_regime(df: pd.DataFrame) -> str:
+    """
+    Return the latest market regime.
+
+    Examples:
         STRONG BULL
         BULL
         SIDEWAYS
         BEAR
         STRONG BEAR
+        UNKNOWN
     """
-    close = _safe_value(row, "close")
-    ema20 = _safe_value(row, "ema20")
-    ema50 = _safe_value(row, "ema50")
-    ema200 = _safe_value(row, "ema200")
-    adx = _safe_value(row, "adx14")
+    features = add_regime_features(df)
 
-    # If the long-term EMA is not available yet, use a simpler
-    # short/medium-term classification.
-    if close is None:
+    if features.empty or "regime" not in features.columns:
         return "UNKNOWN"
 
-    if ema20 is None:
+    latest = features["regime"].iloc[-1]
+
+    if pd.isna(latest):
         return "UNKNOWN"
 
-    if ema50 is None:
-        if close > ema20:
-            return "BULL"
-        if close < ema20:
-            return "BEAR"
-        return "SIDEWAYS"
+    return str(latest)
 
-    trend_strength = adx if adx is not None else 0.0
 
-    if ema200 is not None:
-        if (
-            close > ema20
-            and ema20 > ema50
-            and ema50 > ema200
-        ):
-            if trend_strength >= 25:
-                return "STRONG BULL"
-            return "BULL"
+def get_regime_score(df: pd.DataFrame) -> float:
+    """Return the latest numerical regime score."""
+    features = add_regime_features(df)
 
-        if (
-            close < ema20
-            and ema20 < ema50
-            and ema50 < ema200
-        ):
-            if trend_strength >= 25:
-                return "STRONG BEAR"
-            return "BEAR"
+    if features.empty:
+        return 0.0
 
-        if close > ema50 and ema50 >= ema200:
-            return "BULL"
+    value = features["regime_score"].iloc[-1]
 
-        if close < ema50 and ema50 <= ema200:
-            return "BEAR"
+    if pd.isna(value):
+        return 0.0
 
-        return "SIDEWAYS"
+    return float(value)
 
-    # Fallback when fewer than 200 candles are available.
-    if close > ema20 > ema50:
-        return "BULL"
 
-    if close < ema20 < ema50:
-        return "BEAR"
-
-    return "SIDEWAYS"
+__all__ = [
+    "add_regime_features",
+    "detect_regime",
+    "get_regime_score",
+]
