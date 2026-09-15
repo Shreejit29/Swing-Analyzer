@@ -1,187 +1,163 @@
-from __future__ import annotations
+"""
+Gradient Boosting classifier for swing direction.
 
-from dataclasses import dataclass
-from typing import Optional
+Robust to OHLCV column capitalization and Yahoo Finance naming.
+"""
+
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.impute import SimpleImputer
-from sklearn.pipeline import Pipeline
-
-from src.features.engine import build_features, feature_columns
 
 
-@dataclass
-class SwingClassifier:
-    """
-    Gradient Boosting classifier for short-term swing direction.
+def _get_close(df: pd.DataFrame) -> pd.Series:
+    """Find Close regardless of common column naming."""
+    candidates = ["Close", "close", "Adj Close", "adj close"]
 
-    Target:
-        1 -> closing price is higher after `horizon` trading days
-        0 -> closing price is not higher after `horizon` trading days
-    """
+    for name in candidates:
+        if name in df.columns:
+            value = df[name]
+            if isinstance(value, pd.DataFrame):
+                value = value.iloc[:, 0]
+            return pd.to_numeric(value, errors="coerce")
 
-    horizon: int = 5
-    probability_threshold: float = 0.60
-    random_state: int = 42
-    min_samples: int = 150
+    for col in df.columns:
+        text = str(col).lower()
+        if (
+            text.startswith("close_")
+            or text.endswith("_close")
+            or text.startswith("adj close_")
+            or text.endswith("_adj close")
+        ):
+            value = df[col]
+            if isinstance(value, pd.DataFrame):
+                value = value.iloc[:, 0]
+            return pd.to_numeric(value, errors="coerce")
 
-    def __post_init__(self):
-        self.pipeline: Optional[Pipeline] = None
-        self.columns: list[str] = []
-        self.trained_rows: int = 0
-        self.training_accuracy: Optional[float] = None
-        self.class_balance: Optional[dict] = None
+    raise KeyError(
+        "'close' column not found. "
+        f"Available columns: {list(df.columns)[:20]}"
+    )
 
-    def _make_target(self, features: pd.DataFrame) -> pd.Series:
-        """Create the future-direction classification target."""
-        future_close = features["close"].shift(-self.horizon)
 
-        future_return = (
-            future_close / features["close"]
-        ) - 1.0
+class GradientBoostingSwingClassifier:
+    """Train a Gradient Boosting model to predict future positive returns."""
 
-        # Do not convert the final horizon rows into class 0.
-        # They have no future observation and must remain NaN.
-        target = pd.Series(
-            np.nan,
-            index=features.index,
-            dtype="float64",
-        )
+    def __init__(self, horizon: int = 5, random_state: int = 42):
+        self.horizon = int(horizon)
+        self.random_state = random_state
+        self.model = None
+        self.feature_columns: list[str] = []
+        self.class_balance = {}
+        self.trained_rows = 0
 
-        valid = future_return.notna()
-        target.loc[valid] = (
-            future_return.loc[valid] > 0
-        ).astype(int)
+    def _prepare_features(self, features: pd.DataFrame) -> pd.DataFrame:
+        x = features.copy()
 
-        return target
+        # MultiIndex columns can occur when Yahoo data is passed through.
+        if isinstance(x.columns, pd.MultiIndex):
+            x.columns = [
+                "_".join(str(v) for v in col if str(v).lower() != "nan")
+                for col in x.columns
+            ]
 
-    def fit(self, df: pd.DataFrame) -> "SwingClassifier":
-        """Build features and train the Gradient Boosting model."""
-        if df is None or df.empty:
-            raise ValueError("No market data supplied to the AI model.")
+        # Remove raw market columns from the model feature matrix.
+        excluded = {
+            "open", "high", "low", "close", "adj close", "volume",
+            "Open", "High", "Low", "Close", "Adj Close", "Volume",
+            "target", "future_return",
+        }
 
-        if self.horizon < 1:
-            raise ValueError("Prediction horizon must be at least 1 day.")
+        numeric = x.select_dtypes(include=[np.number]).copy()
+        keep = [c for c in numeric.columns if str(c) not in excluded]
+        numeric = numeric[keep]
 
-        features = build_features(df)
+        numeric = numeric.replace([np.inf, -np.inf], np.nan)
+        numeric = numeric.ffill().bfill()
 
-        if features.empty:
-            raise ValueError("Unable to generate features for model training.")
+        return numeric
 
-        self.columns = feature_columns(features)
+    def fit(self, features: pd.DataFrame):
+        if not isinstance(features, pd.DataFrame) or features.empty:
+            raise ValueError("No feature data available for model training.")
 
-        if not self.columns:
-            raise ValueError("No usable model features were generated.")
+        close = _get_close(features)
 
-        target = self._make_target(features)
+        # Future return. The final horizon rows intentionally remain NaN.
+        future_return = close.shift(-self.horizon) / close - 1.0
+        target = pd.Series(np.nan, index=features.index, dtype=float)
+        valid_target = future_return.notna() & np.isfinite(future_return)
+        target.loc[valid_target] = (future_return.loc[valid_target] > 0).astype(int)
 
-        X = features[self.columns].copy()
-
-        # Replace infinite values before imputation.
-        X = X.replace(
-            [np.inf, -np.inf],
-            np.nan,
-        )
+        x = self._prepare_features(features)
 
         valid = target.notna()
-
-        X = X.loc[valid]
+        x = x.loc[valid]
         y = target.loc[valid].astype(int)
 
-        if len(X) < self.min_samples:
+        if len(x) < 40:
             raise ValueError(
-                f"Not enough historical rows. "
-                f"Need at least {self.min_samples}, got {len(X)}."
+                f"Not enough valid observations for training ({len(x)})."
+            )
+
+        # Remove rows that still have missing feature values.
+        complete = x.notna().all(axis=1)
+        x = x.loc[complete]
+        y = y.loc[complete]
+
+        if len(x) < 40:
+            raise ValueError(
+                f"Not enough complete observations for training ({len(x)})."
             )
 
         if y.nunique() < 2:
             raise ValueError(
                 "Training data contains only one target class. "
-                "Try a longer historical period."
+                "Try a different stock or prediction horizon."
             )
 
-        # Store class balance as a useful diagnostic.
-        counts = y.value_counts().to_dict()
+        self.feature_columns = list(x.columns)
+        self.trained_rows = len(x)
+        self.class_balance = y.value_counts(normalize=True).to_dict()
 
-        self.class_balance = {
-            "down": int(counts.get(0, 0)),
-            "up": int(counts.get(1, 0)),
-        }
-
-        self.pipeline = Pipeline(
-            [
-                (
-                    "imputer",
-                    SimpleImputer(strategy="median"),
-                ),
-                (
-                    "model",
-                    GradientBoostingClassifier(
-                        n_estimators=200,
-                        learning_rate=0.04,
-                        max_depth=2,
-                        min_samples_leaf=8,
-                        subsample=0.85,
-                        random_state=self.random_state,
-                    ),
-                ),
-            ]
+        self.model = GradientBoostingClassifier(
+            n_estimators=200,
+            learning_rate=0.04,
+            max_depth=2,
+            min_samples_leaf=8,
+            subsample=0.85,
+            random_state=self.random_state,
         )
 
-        self.pipeline.fit(X, y)
-
-        self.trained_rows = len(X)
-
-        # Diagnostic only. This is deliberately labelled as training
-        # accuracy in the UI and must not be interpreted as live performance.
-        self.training_accuracy = float(
-            self.pipeline.score(X, y)
-        )
-
+        self.model.fit(x, y)
         return self
 
-    def predict_proba(self, df: pd.DataFrame) -> float:
-        """Return probability of an upward move for the latest candle."""
-        if self.pipeline is None:
-            raise RuntimeError(
-                "Model has not been fitted. Call fit() first."
-            )
+    def predict_proba(self, features: pd.DataFrame) -> np.ndarray:
+        if self.model is None:
+            raise ValueError("Model has not been trained.")
 
-        if df is None or df.empty:
-            raise ValueError("No market data supplied for prediction.")
+        x = self._prepare_features(features)
 
-        features = build_features(df)
+        # Recreate missing columns if necessary and preserve training order.
+        for col in self.feature_columns:
+            if col not in x.columns:
+                x[col] = 0.0
 
-        if features.empty:
-            raise ValueError(
-                "Unable to generate features for prediction."
-            )
+        x = x[self.feature_columns]
+        x = x.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0.0)
 
-        missing = [
-            column
-            for column in self.columns
-            if column not in features.columns
-        ]
+        return self.model.predict_proba(x)
 
-        if missing:
-            raise ValueError(
-                "Prediction features are missing: "
-                + ", ".join(missing)
-            )
+    def predict_latest(self, features: pd.DataFrame) -> tuple[int, float]:
+        probabilities = self.predict_proba(features)
 
-        row = features[self.columns].iloc[[-1]].copy()
+        if len(probabilities) == 0:
+            raise ValueError("No rows available for prediction.")
 
-        row = row.replace(
-            [np.inf, -np.inf],
-            np.nan,
-        )
+        latest = probabilities[-1]
+        down_probability = float(latest[0])
+        up_probability = float(latest[1])
 
-        probability = float(
-            self.pipeline.predict_proba(row)[0, 1]
-        )
-
-        return float(
-            np.clip(probability, 0.0, 1.0)
-        )
+        prediction = int(up_probability >= down_probability)
+        return prediction, up_probability
