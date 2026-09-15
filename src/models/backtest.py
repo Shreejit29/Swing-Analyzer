@@ -1,477 +1,560 @@
-"""
-Walk-forward backtesting engine for the Swing Analyzer.
-
-Convention:
-    OHLCV columns are lowercase:
-        open, high, low, close, volume
-
-The backtester:
-    - avoids look-ahead bias
-    - enters on the next day's open
-    - uses fixed fractional risk
-    - accounts for transaction costs and slippage
-    - applies stop-loss / target
-    - force-closes open positions at the end
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
+from src.features.engine import build_features
+from .classifier import SwingClassifier
+
 
 @dataclass
-class Trade:
-    entry_date: Any
-    exit_date: Any
-    entry_price: float
-    exit_price: float
-    shares: float
-    pnl: float
-    return_pct: float
-    reason: str
+class BacktestConfig:
+    initial_capital: float = 100000.0
+    horizon: int = 5
+
+    probability_threshold: float = 0.60
+    stop_loss_pct: float = 0.03
+    target_pct: float = 0.06
+
+    risk_per_trade: float = 0.01
+    transaction_cost: float = 0.001
+    slippage: float = 0.0005
+
+    retrain_every: int = 20
+    min_train_rows: int = 180
 
 
-def _get_column(df: pd.DataFrame, name: str) -> pd.Series:
-    """Case-insensitive column lookup."""
-    if name in df.columns:
-        return pd.to_numeric(df[name], errors="coerce")
+def _validate_config(cfg: BacktestConfig):
+    if cfg.initial_capital <= 0:
+        raise ValueError("Initial capital must be greater than zero.")
 
-    lookup = {str(c).lower(): c for c in df.columns}
+    if cfg.horizon < 1:
+        raise ValueError("Prediction horizon must be at least 1 day.")
 
-    if name.lower() in lookup:
-        return pd.to_numeric(df[lookup[name.lower()]], errors="coerce")
+    if not 0.50 <= cfg.probability_threshold <= 0.95:
+        raise ValueError(
+            "Probability threshold must be between 0.50 and 0.95."
+        )
 
-    raise ValueError(f"Required column '{name}' not found.")
+    if cfg.stop_loss_pct <= 0:
+        raise ValueError("Stop loss percentage must be greater than zero.")
 
+    if cfg.target_pct <= 0:
+        raise ValueError("Target percentage must be greater than zero.")
 
-def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a clean lowercase OHLCV DataFrame."""
-    out = pd.DataFrame(index=df.index)
+    if cfg.risk_per_trade <= 0:
+        raise ValueError("Risk per trade must be greater than zero.")
 
-    for column in ["open", "high", "low", "close", "volume"]:
-        out[column] = _get_column(df, column)
+    if cfg.retrain_every < 1:
+        raise ValueError("Retraining interval must be at least 1.")
 
-    out = out.replace([np.inf, -np.inf], np.nan)
-    out = out.dropna(subset=["open", "high", "low", "close"])
-
-    return out
-
-
-def _extract_signal(row: pd.Series) -> int:
-    """
-    Convert common signal formats into:
-
-        1  = long
-        0  = no position
-       -1  = short
-
-    The current Swing Analyzer is primarily long-oriented, but the
-    function supports common signal column names.
-    """
-    for column in ["signal", "Signal", "prediction", "Prediction"]:
-        if column in row.index:
-            value = row[column]
-
-            if isinstance(value, str):
-                text = value.upper().strip()
-
-                if text in {"BUY", "LONG", "1", "STRONG BUY"}:
-                    return 1
-
-                if text in {"SELL", "SHORT", "-1", "STRONG SELL"}:
-                    return -1
-
-                return 0
-
-            try:
-                numeric = float(value)
-
-                if numeric > 0:
-                    return 1
-
-                if numeric < 0:
-                    return -1
-
-            except (TypeError, ValueError):
-                pass
-
-    return 0
+    if cfg.min_train_rows < 30:
+        raise ValueError("Minimum training rows must be at least 30.")
 
 
-def _position_size(
+def _execution_cost(cfg: BacktestConfig) -> float:
+    return (
+        cfg.transaction_cost * 2.0
+        + cfg.slippage * 2.0
+    )
+
+
+def _open_position(
+    side: str,
+    next_open: float,
     capital: float,
-    risk_per_trade: float,
-    entry_price: float,
-    stop_price: float,
-) -> float:
-    """
-    Calculate position size from the amount of capital at risk.
+    cfg: BacktestConfig,
+    entry_date,
+):
+    if side == "BUY":
+        entry = next_open * (1.0 + cfg.slippage)
+        stop = entry * (1.0 - cfg.stop_loss_pct)
+        target = entry * (1.0 + cfg.target_pct)
+    else:
+        entry = next_open * (1.0 - cfg.slippage)
+        stop = entry * (1.0 + cfg.stop_loss_pct)
+        target = entry * (1.0 - cfg.target_pct)
 
-    Example:
-        capital = ₹100,000
-        risk = 1%
-        entry = ₹100
-        stop = ₹97
+    risk_amount = capital * cfg.risk_per_trade
+    risk_per_share = abs(entry - stop)
 
-        risk amount = ₹1,000
-        risk/share = ₹3
-        shares ≈ 333
-    """
-    risk_amount = capital * risk_per_trade
-    risk_per_share = abs(entry_price - stop_price)
+    if risk_per_share <= 0:
+        return None
 
-    if risk_amount <= 0 or risk_per_share <= 0:
-        return 0.0
+    quantity = risk_amount / risk_per_share
 
-    return max(0.0, risk_amount / risk_per_share)
+    return {
+        "side": side,
+        "entry": float(entry),
+        "stop": float(stop),
+        "target": float(target),
+        "quantity": float(quantity),
+        "date": entry_date,
+        "bars": 0,
+    }
 
 
-def _apply_slippage(price: float, side: int, is_entry: bool, slippage: float) -> float:
-    """Apply percentage slippage."""
-    if side == 1:
-        # Long:
-        # entry becomes more expensive, exit becomes cheaper.
-        if is_entry:
-            return price * (1 + slippage)
-        return price * (1 - slippage)
+def _close_position(
+    position,
+    exit_price,
+    date,
+    reason,
+    cfg: BacktestConfig,
+):
+    entry = position["entry"]
+    quantity = position["quantity"]
 
-    # Short:
-    # entry becomes cheaper, exit becomes more expensive.
-    if is_entry:
-        return price * (1 - slippage)
+    if position["side"] == "BUY":
+        gross_pnl = (
+            exit_price - entry
+        ) * quantity
+    else:
+        gross_pnl = (
+            entry - exit_price
+        ) * quantity
 
-    return price * (1 + slippage)
+    trading_cost = (
+        entry
+        * quantity
+        * _execution_cost(cfg)
+    )
+
+    net_pnl = gross_pnl - trading_cost
+
+    invested = entry * quantity
+
+    trade_return = (
+        net_pnl / invested
+        if invested > 0
+        else 0.0
+    )
+
+    return {
+        "entry_date": position["date"],
+        "exit_date": date,
+        "side": position["side"],
+        "entry": float(entry),
+        "exit": float(exit_price),
+        "quantity": float(quantity),
+        "return": float(trade_return),
+        "pnl": float(net_pnl),
+        "reason": reason,
+        "bars": position["bars"],
+    }
 
 
 def run_backtest(
     df: pd.DataFrame,
-    initial_capital: float = 100000.0,
-    risk_per_trade: float = 0.01,
-    stop_loss_pct: float = 0.03,
-    target_pct: float = 0.06,
-    transaction_cost_pct: float = 0.001,
-    slippage_pct: float = 0.0005,
-) -> Dict[str, Any]:
+    config: BacktestConfig | None = None,
+):
     """
-    Run a signal-based backtest.
+    Walk-forward backtest.
 
-    Parameters
-    ----------
-    df:
-        OHLCV DataFrame. Must contain a signal column.
-
-    initial_capital:
-        Starting capital.
-
-    risk_per_trade:
-        Fraction of current equity risked on each trade.
-
-    stop_loss_pct:
-        Stop distance from entry.
-
-    target_pct:
-        Target distance from entry.
-
-    transaction_cost_pct:
-        Round-trip transaction-cost approximation.
-
-    slippage_pct:
-        Slippage applied to executions.
-
-    Returns
-    -------
-    dict
-        Contains trades, equity curve and summary statistics.
+    Signals are generated using information available at the
+    current candle and executed at the following day's open.
     """
-    if df is None or len(df) < 3:
-        raise ValueError("At least 3 rows of data are required for backtesting.")
 
-    data = _normalize_ohlcv(df)
+    cfg = config or BacktestConfig()
+    _validate_config(cfg)
 
-    # Preserve signal columns from original dataframe.
-    for column in df.columns:
-        if column not in data.columns:
-            data[column] = df.loc[data.index, column]
+    if df is None or df.empty:
+        raise ValueError("No market data supplied for backtesting.")
 
-    data = data.sort_index()
+    # Central feature pipeline also normalizes OHLCV.
+    data = build_features(df).copy()
 
-    capital = float(initial_capital)
-    equity = capital
+    required = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    ]
 
-    trades: List[Trade] = []
-    equity_records: List[Dict[str, Any]] = []
+    missing = [
+        col for col in required
+        if col not in data.columns
+    ]
 
-    position: Optional[Dict[str, Any]] = None
+    if missing:
+        raise ValueError(
+            "Backtest data is missing: "
+            + ", ".join(missing)
+        )
 
-    for i in range(len(data)):
+    minimum_rows = (
+        cfg.min_train_rows
+        + cfg.horizon
+        + 10
+    )
+
+    if len(data) < minimum_rows:
+        raise ValueError(
+            f"Need at least {minimum_rows} rows for backtesting. "
+            f"Only {len(data)} rows are available."
+        )
+
+    capital = float(cfg.initial_capital)
+
+    equity_records = []
+    trades = []
+
+    model = None
+    last_train_index = -10**9
+    position = None
+
+    last_processed_index = (
+        len(data)
+        - cfg.horizon
+        - 1
+    )
+
+    for i in range(
+        cfg.min_train_rows,
+        last_processed_index + 1,
+    ):
         row = data.iloc[i]
         date = data.index[i]
 
-        open_price = float(row["open"])
-        high_price = float(row["high"])
-        low_price = float(row["low"])
-        close_price = float(row["close"])
-
-        # -----------------------------------------------------
-        # Manage an existing position.
-        # -----------------------------------------------------
+        # ---------------------------------------------------------
+        # Manage open position
+        # ---------------------------------------------------------
         if position is not None:
-            side = position["side"]
-            stop_price = position["stop_price"]
-            target_price = position["target_price"]
+            position["bars"] += 1
+
+            high = float(row["high"])
+            low = float(row["low"])
 
             exit_price = None
             reason = None
 
-            if side == 1:
-                stop_hit = low_price <= stop_price
-                target_hit = high_price >= target_price
+            if position["side"] == "BUY":
 
                 # Conservative assumption:
-                # if both are touched on the same candle,
-                # assume stop was hit first.
-                if stop_hit:
-                    exit_price = stop_price
+                # stop is considered hit first if both occur.
+                if low <= position["stop"]:
+                    exit_price = position["stop"]
                     reason = "STOP"
 
-                elif target_hit:
-                    exit_price = target_price
+                elif high >= position["target"]:
+                    exit_price = position["target"]
                     reason = "TARGET"
 
             else:
-                stop_hit = high_price >= stop_price
-                target_hit = low_price <= target_price
 
-                if stop_hit:
-                    exit_price = stop_price
+                if high >= position["stop"]:
+                    exit_price = position["stop"]
                     reason = "STOP"
 
-                elif target_hit:
-                    exit_price = target_price
+                elif low <= position["target"]:
+                    exit_price = position["target"]
                     reason = "TARGET"
 
-            # Force close on final candle.
-            if i == len(data) - 1 and exit_price is None:
-                exit_price = close_price
-                reason = "END"
+            # Time-based exit.
+            if (
+                exit_price is None
+                and position["bars"] >= cfg.horizon
+            ):
+                exit_price = float(row["close"])
+                reason = "TIME"
 
             if exit_price is not None:
-                executed_exit = _apply_slippage(
+
+                trade = _close_position(
+                    position,
                     exit_price,
-                    side,
-                    False,
-                    slippage_pct,
+                    date,
+                    reason,
+                    cfg,
                 )
 
-                entry_price = position["entry_price"]
-                shares = position["shares"]
-
-                gross_pnl = (
-                    executed_exit - entry_price
-                ) * shares * side
-
-                entry_value = abs(entry_price * shares)
-                exit_value = abs(executed_exit * shares)
-
-                transaction_cost = (
-                    entry_value + exit_value
-                ) * transaction_cost_pct
-
-                pnl = gross_pnl - transaction_cost
-
-                equity += pnl
-
-                return_pct = (
-                    pnl / entry_value
-                    if entry_value > 0
-                    else 0.0
-                )
-
-                trades.append(
-                    Trade(
-                        entry_date=position["entry_date"],
-                        exit_date=date,
-                        entry_price=entry_price,
-                        exit_price=executed_exit,
-                        shares=shares,
-                        pnl=float(pnl),
-                        return_pct=float(return_pct),
-                        reason=reason,
-                    )
-                )
+                capital += trade["pnl"]
+                trades.append(trade)
 
                 position = None
 
-        # -----------------------------------------------------
-        # Generate a new entry.
-        #
-        # Important:
-        # Signal on today's candle is executed at the NEXT
-        # candle's open. This prevents look-ahead bias.
-        # -----------------------------------------------------
-        if position is None and i < len(data) - 1:
-            signal = _extract_signal(row)
+        # ---------------------------------------------------------
+        # Retrain model
+        # ---------------------------------------------------------
+        if (
+            position is None
+            and (
+                model is None
+                or i - last_train_index
+                >= cfg.retrain_every
+            )
+        ):
 
-            if signal != 0:
-                next_row = data.iloc[i + 1]
-                next_open = float(next_row["open"])
+            try:
+                training_data = data.iloc[: i + 1][
+                    required
+                ]
 
-                executed_entry = _apply_slippage(
-                    next_open,
-                    signal,
-                    True,
-                    slippage_pct,
+                model = SwingClassifier(
+                    horizon=cfg.horizon,
+                    probability_threshold=(
+                        cfg.probability_threshold
+                    ),
+                    min_samples=cfg.min_train_rows,
                 )
 
-                if signal == 1:
-                    stop_price = executed_entry * (1 - stop_loss_pct)
-                    target_price = executed_entry * (1 + target_pct)
+                model.fit(training_data)
+
+                last_train_index = i
+
+            except Exception:
+                model = None
+
+        # ---------------------------------------------------------
+        # Generate signal
+        # ---------------------------------------------------------
+        if position is None and model is not None:
+
+            current_data = data.iloc[: i + 1][
+                required
+            ]
+
+            try:
+                p_up = model.predict_proba(
+                    current_data
+                )
+            except Exception:
+                p_up = None
+
+            # Handle either scalar or array probability.
+            if p_up is not None:
+
+                if isinstance(p_up, (list, tuple, np.ndarray)):
+                    arr = np.asarray(p_up)
+
+                    if arr.ndim == 2:
+                        p_up = float(arr[-1, 1])
+                    else:
+                        p_up = float(arr[-1])
+
                 else:
-                    stop_price = executed_entry * (1 + stop_loss_pct)
-                    target_price = executed_entry * (1 - target_pct)
+                    p_up = float(p_up)
 
-                shares = _position_size(
-                    capital=equity,
-                    risk_per_trade=risk_per_trade,
-                    entry_price=executed_entry,
-                    stop_price=stop_price,
-                )
+                if p_up >= cfg.probability_threshold:
+                    side = "BUY"
 
-                # Never allocate more than available capital.
-                max_shares = (
-                    equity / executed_entry
-                    if executed_entry > 0
-                    else 0.0
-                )
+                elif (
+                    1.0 - p_up
+                    >= cfg.probability_threshold
+                ):
+                    side = "SELL"
 
-                shares = min(shares, max_shares)
+                else:
+                    side = None
 
-                if shares > 0:
-                    position = {
-                        "side": signal,
-                        "entry_date": data.index[i + 1],
-                        "entry_price": executed_entry,
-                        "shares": shares,
-                        "stop_price": stop_price,
-                        "target_price": target_price,
-                    }
+                # -------------------------------------------------
+                # Enter next day
+                # -------------------------------------------------
+                if side is not None:
+
+                    next_row = data.iloc[i + 1]
+                    next_open = float(
+                        next_row["open"]
+                    )
+
+                    if (
+                        np.isfinite(next_open)
+                        and next_open > 0
+                    ):
+                        position = _open_position(
+                            side,
+                            next_open,
+                            capital,
+                            cfg,
+                            data.index[i + 1],
+                        )
+
+        # ---------------------------------------------------------
+        # Mark-to-market equity
+        # ---------------------------------------------------------
+        equity = capital
+
+        if position is not None:
+
+            current_close = float(
+                row["close"]
+            )
+
+            if position["side"] == "BUY":
+                unrealized = (
+                    current_close
+                    - position["entry"]
+                ) * position["quantity"]
+
+            else:
+                unrealized = (
+                    position["entry"]
+                    - current_close
+                ) * position["quantity"]
+
+            equity += unrealized
 
         equity_records.append(
             {
                 "date": date,
-                "equity": equity,
+                "equity": float(equity),
             }
         )
 
-    equity_curve = pd.DataFrame(equity_records)
+    # -------------------------------------------------------------
+    # Force close remaining position
+    # -------------------------------------------------------------
+    if position is not None:
 
-    # ---------------------------------------------------------
-    # Performance statistics
-    # ---------------------------------------------------------
-    trade_df = pd.DataFrame(
-        [
-            {
-                "entry_date": trade.entry_date,
-                "exit_date": trade.exit_date,
-                "entry_price": trade.entry_price,
-                "exit_price": trade.exit_price,
-                "shares": trade.shares,
-                "pnl": trade.pnl,
-                "return_pct": trade.return_pct,
-                "reason": trade.reason,
-            }
-            for trade in trades
-        ]
+        final_date = data.index[-1]
+        final_close = float(
+            data["close"].iloc[-1]
+        )
+
+        trade = _close_position(
+            position,
+            final_close,
+            final_date,
+            "END",
+            cfg,
+        )
+
+        capital += trade["pnl"]
+        trades.append(trade)
+
+        if equity_records:
+            equity_records[-1]["equity"] = capital
+
+    # -------------------------------------------------------------
+    # Equity curve
+    # -------------------------------------------------------------
+    equity_df = pd.DataFrame(
+        equity_records
     )
 
-    if trades:
-        wins = [trade for trade in trades if trade.pnl > 0]
-        losses = [trade for trade in trades if trade.pnl < 0]
+    if not equity_df.empty:
 
-        winning_pnl = sum(trade.pnl for trade in wins)
-        losing_pnl = abs(sum(trade.pnl for trade in losses))
+        equity_df = equity_df.set_index(
+            "date"
+        )
 
-        win_rate = len(wins) / len(trades)
-
-        if losing_pnl > 0:
-            profit_factor = winning_pnl / losing_pnl
-        else:
-            profit_factor = np.inf if winning_pnl > 0 else 0.0
-
-        avg_trade = np.mean([trade.pnl for trade in trades])
-
-    else:
-        win_rate = 0.0
-        profit_factor = 0.0
-        avg_trade = 0.0
-
-    if not equity_curve.empty:
-        equity_values = equity_curve["equity"]
-
-        running_max = equity_values.cummax()
+        peak = equity_df[
+            "equity"
+        ].cummax()
 
         drawdown = (
-            equity_values - running_max
-        ) / running_max.replace(0, np.nan)
+            equity_df["equity"] / peak
+        ) - 1.0
 
-        max_drawdown = float(drawdown.min())
+        max_drawdown = float(
+            drawdown.min()
+        )
 
-        final_equity = float(equity_values.iloc[-1])
+        total_return = (
+            capital
+            / cfg.initial_capital
+        ) - 1.0
 
     else:
+
+        equity_df = pd.DataFrame(
+            columns=["equity"]
+        )
+
         max_drawdown = 0.0
-        final_equity = capital
+        total_return = 0.0
 
-    total_return = (
-        final_equity / initial_capital - 1
-        if initial_capital > 0
-        else 0.0
-    )
+    # -------------------------------------------------------------
+    # Trade statistics
+    # -------------------------------------------------------------
+    trades_df = pd.DataFrame(trades)
 
-    summary = {
-        "initial_capital": float(initial_capital),
-        "final_equity": final_equity,
-        "total_return": float(total_return),
-        "total_return_pct": float(total_return * 100),
-        "total_trades": len(trades),
-        "winning_trades": sum(trade.pnl > 0 for trade in trades),
-        "losing_trades": sum(trade.pnl < 0 for trade in trades),
-        "win_rate": float(win_rate),
-        "profit_factor": float(profit_factor),
-        "average_trade_pnl": float(avg_trade),
-        "max_drawdown": float(max_drawdown),
-        "max_drawdown_pct": float(max_drawdown * 100),
-    }
+    if not trades_df.empty:
+
+        wins = trades_df[
+            trades_df["pnl"] > 0
+        ]
+
+        losses = trades_df[
+            trades_df["pnl"] < 0
+        ]
+
+        win_rate = (
+            len(wins)
+            / len(trades_df)
+        )
+
+        gross_profit = float(
+            wins["pnl"].sum()
+        )
+
+        gross_loss = abs(
+            float(losses["pnl"].sum())
+        )
+
+        profit_factor = (
+            gross_profit / gross_loss
+            if gross_loss > 0
+            else np.inf
+        )
+
+        average_trade = float(
+            trades_df["return"].mean()
+        )
+
+    else:
+
+        win_rate = 0.0
+        profit_factor = 0.0
+        average_trade = 0.0
 
     return {
-        "summary": summary,
-        "trades": trade_df,
-        "equity_curve": equity_curve,
+        "initial_capital": float(
+            cfg.initial_capital
+        ),
+        "final_capital": float(
+            capital
+        ),
+        "total_return": float(
+            total_return
+        ),
+        "max_drawdown": float(
+            max_drawdown
+        ),
+        "trades": int(
+            len(trades_df)
+        ),
+        "win_rate": float(
+            win_rate
+        ),
+        "profit_factor": float(
+            profit_factor
+        ),
+        "average_trade": float(
+            average_trade
+        ),
+        "equity_curve": equity_df,
+        "trades_df": trades_df,
     }
 
 
 def backtest(
     df: pd.DataFrame,
-    **kwargs: Any,
-) -> Dict[str, Any]:
+    **kwargs,
+):
     """
     Compatibility wrapper.
-
-    Allows existing code to call:
-
-        backtest(df)
-
-    while using the new engine internally.
     """
-    return run_backtest(df, **kwargs)
+    return run_backtest(
+        df,
+        BacktestConfig(**kwargs),
+    )
 
 
 __all__ = [
-    "Trade",
+    "BacktestConfig",
     "run_backtest",
     "backtest",
 ]
