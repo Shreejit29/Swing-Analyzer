@@ -14,7 +14,8 @@ Supported prediction horizons:
     20D
 
 Target types:
-    - Direction
+    - Binary Direction
+    - Three-class Direction
     - Future return
     - Maximum favourable excursion
     - Maximum adverse excursion
@@ -46,6 +47,10 @@ class TargetSpec:
     @property
     def direction_column(self) -> str:
         return f"Direction_{self.horizon}"
+
+    @property
+    def three_class_direction_column(self) -> str:
+        return f"Direction3C_{self.horizon}"
 
     @property
     def return_column(self) -> str:
@@ -129,11 +134,19 @@ def add_direction_targets(
 
         1 -> future return > threshold
         0 -> future return <= threshold
+
+    The final `horizon` rows do not have a known future return,
+    therefore their target is kept as NaN.
     """
 
     if "Close" not in data.columns:
         raise ValueError(
             "Close column is required."
+        )
+
+    if threshold < 0:
+        raise ValueError(
+            "threshold cannot be negative."
         )
 
     result = data.copy()
@@ -172,6 +185,175 @@ def add_direction_targets(
             future_return.isna(),
             f"Direction_{horizon}",
         ] = np.nan
+
+    return result
+
+
+def add_noise_aware_direction_targets(
+    data: pd.DataFrame,
+    horizons: Iterable[int] = DEFAULT_HORIZONS,
+    threshold: float = 0.01,
+) -> pd.DataFrame:
+    """
+    Create three-class direction targets.
+
+    This is a research-oriented alternative to the existing
+    binary Direction_* target.
+
+    Classes
+    -------
+    -1 -> BEARISH
+     0 -> NEUTRAL / MARKET NOISE
+     1 -> BULLISH
+
+    Example with threshold=0.01:
+
+        future return > +1%  -> +1
+        future return < -1%  -> -1
+        otherwise             ->  0
+
+    The existing Direction_* and Future_Return_* columns are
+    preserved.
+
+    IMPORTANT:
+    This function does NOT replace the existing binary target.
+    It adds a separate target so that both approaches can be
+    compared during research.
+    """
+
+    if "Close" not in data.columns:
+        raise ValueError(
+            "Close column is required."
+        )
+
+    if threshold < 0:
+        raise ValueError(
+            "threshold cannot be negative."
+        )
+
+    result = data.copy()
+
+    horizons = validate_horizons(
+        horizons
+    )
+
+    for horizon in horizons:
+
+        future_return = (
+            result["Close"].shift(-horizon)
+            / result["Close"]
+            - 1.0
+        )
+
+        column = (
+            f"Direction3C_{horizon}"
+        )
+
+        # Start with missing values.
+        result[column] = np.nan
+
+        valid = future_return.notna()
+
+        # Bullish
+        result.loc[
+            valid
+            & (
+                future_return > threshold
+            ),
+            column,
+        ] = 1.0
+
+        # Bearish
+        result.loc[
+            valid
+            & (
+                future_return < -threshold
+            ),
+            column,
+        ] = -1.0
+
+        # Neutral / noise
+        result.loc[
+            valid
+            & (
+                future_return >= -threshold
+            )
+            & (
+                future_return <= threshold
+            ),
+            column,
+        ] = 0.0
+
+    return result
+
+
+def direction_class_name(
+    value: int | float,
+) -> str:
+    """
+    Convert a three-class direction value into a
+    human-readable label.
+
+    Returns
+    -------
+    str
+        BEARISH, NEUTRAL, BULLISH or UNKNOWN.
+    """
+
+    if pd.isna(value):
+        return "UNKNOWN"
+
+    value = int(value)
+
+    mapping = {
+        -1: "BEARISH",
+        0: "NEUTRAL",
+        1: "BULLISH",
+    }
+
+    return mapping.get(
+        value,
+        "UNKNOWN",
+    )
+
+
+def direction_class_distribution(
+    labels: pd.Series | np.ndarray,
+) -> dict[str, float]:
+    """
+    Calculate the proportion of each direction class.
+
+    This is useful for detecting class imbalance.
+
+    Example output:
+
+        {
+            "BEARISH": 0.31,
+            "NEUTRAL": 0.24,
+            "BULLISH": 0.45
+        }
+    """
+
+    series = pd.Series(
+        labels
+    ).dropna()
+
+    if series.empty:
+        return {}
+
+    distribution = (
+        series.value_counts(
+            normalize=True
+        )
+    )
+
+    result: dict[str, float] = {}
+
+    for value, proportion in distribution.items():
+
+        result[
+            direction_class_name(value)
+        ] = float(proportion)
 
     return result
 
@@ -347,7 +529,7 @@ def build_all_targets(
     direction_threshold: float = 0.0,
 ) -> pd.DataFrame:
     """
-    Build the complete target set.
+    Build the complete existing target set.
 
     Processing order:
 
@@ -356,6 +538,10 @@ def build_all_targets(
         Future path
             ↓
         Target ranges
+
+    The three-class target is intentionally NOT included here,
+    because the existing binary target API is used throughout
+    the current research pipeline.
     """
 
     horizons = validate_horizons(
@@ -412,11 +598,15 @@ def target_columns(
     Return every target column.
 
     This function is used as a safety barrier before modelling.
+
+    Both binary Direction_* and three-class Direction3C_*
+    targets are treated as targets.
     """
 
     target_prefixes = (
         "Future_",
         "Direction_",
+        "Direction3C_",
         "MFE_",
         "MAE_",
         "Target_",
@@ -435,10 +625,36 @@ def direction_target(
     data: pd.DataFrame,
     horizon: int,
 ) -> pd.Series:
-    """Return one direction target."""
+    """Return one binary direction target."""
 
     column = (
         f"Direction_{horizon}"
+    )
+
+    if column not in data.columns:
+        raise KeyError(
+            f"Target not found: {column}"
+        )
+
+    return data[column]
+
+
+def three_class_direction_target(
+    data: pd.DataFrame,
+    horizon: int,
+) -> pd.Series:
+    """
+    Return one three-class direction target.
+
+    Values:
+
+        -1 -> BEARISH
+         0 -> NEUTRAL
+         1 -> BULLISH
+    """
+
+    column = (
+        f"Direction3C_{horizon}"
     )
 
     if column not in data.columns:
@@ -606,3 +822,25 @@ def validate_target_columns(
             "Missing target columns: "
             + ", ".join(missing)
         )
+
+
+__all__ = [
+    "TargetSpec",
+    "DEFAULT_HORIZONS",
+    "validate_horizons",
+    "add_direction_targets",
+    "add_noise_aware_direction_targets",
+    "direction_class_name",
+    "direction_class_distribution",
+    "add_path_targets",
+    "add_range_targets",
+    "build_all_targets",
+    "build_targets",
+    "target_columns",
+    "direction_target",
+    "three_class_direction_target",
+    "return_target",
+    "range_targets",
+    "price_range_from_returns",
+    "validate_target_columns",
+]
