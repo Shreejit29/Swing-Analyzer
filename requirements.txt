@@ -1,0 +1,12 @@
+pandas
+numpy
+scikit-learn
+scipy
+yfinance
+pyyaml
+joblib
+plotly
+streamlit
+ta
+pyarrow
+pytest
