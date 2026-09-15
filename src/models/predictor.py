@@ -1,19 +1,21 @@
 """
 Prediction layer for the AI Swing Stock Analyzer.
 
-Provides:
-    analyze_stock()
-    predict_stock()
+Compatible with the existing Stock Analyzer UI.
 
-The returned PredictionResult supports BOTH:
+Returns PredictionResult, which supports both:
 
     pred.probability_up
+    pred["probability_up"]
 
 and:
 
-    pred["probability_up"]
-
-This keeps compatibility with different versions of the UI.
+    pred.confidence
+    pred.signal
+    pred.regime
+    pred.entry
+    pred.stop_loss
+    pred.target
 """
 
 from __future__ import annotations
@@ -29,18 +31,12 @@ from src.models.classifier import SwingClassifier
 
 
 # ============================================================
-# COMPATIBLE RESULT OBJECT
+# RESULT OBJECT
 # ============================================================
 
 class PredictionResult(dict):
     """
-    Dictionary with attribute-style access.
-
-    Examples
-    --------
-    result["probability_up"]
-
-    result.probability_up
+    Dictionary supporting attribute-style access.
     """
 
     def __getattr__(
@@ -77,10 +73,10 @@ def _safe_float(
 
     try:
 
-        value = float(value)
+        result = float(value)
 
-        if np.isfinite(value):
-            return value
+        if np.isfinite(result):
+            return result
 
     except Exception:
         pass
@@ -182,12 +178,11 @@ def _latest_close(
 
 
 # ============================================================
-# SIGNAL
+# SIGNAL LOGIC
 # ============================================================
 
 def _generate_signal(
     probability_up: float,
-    regime: str,
     alignment: float,
     threshold: float,
 ) -> str:
@@ -195,14 +190,13 @@ def _generate_signal(
     Generate BUY / SELL / WAIT.
 
     ML probability is the primary signal.
-    Higher-timeframe trend is confirmation.
+    Higher-timeframe alignment is used as confirmation.
     """
 
     probability_down = (
         1.0 - probability_up
     )
 
-    # Strong bullish probability.
     if probability_up >= threshold:
 
         if alignment < 0:
@@ -210,7 +204,6 @@ def _generate_signal(
 
         return "BUY"
 
-    # Strong bearish probability.
     if probability_down >= threshold:
 
         if alignment > 0:
@@ -281,7 +274,7 @@ def _create_trade_plan(
 
 
 # ============================================================
-# MAIN ANALYSIS
+# MAIN ANALYZER
 # ============================================================
 
 def analyze_stock(
@@ -292,6 +285,10 @@ def analyze_stock(
     target_pct: float = 0.06,
     min_train_samples: int = 30,
 ) -> PredictionResult:
+
+    # --------------------------------------------------------
+    # Validation
+    # --------------------------------------------------------
 
     if not isinstance(
         df,
@@ -420,6 +417,25 @@ def analyze_stock(
     )
 
     # --------------------------------------------------------
+    # CONFIDENCE
+    #
+    # Distance from 50%.
+    #
+    # Example:
+    # 50% probability -> 0% confidence
+    # 70% probability -> 40% confidence
+    # 90% probability -> 80% confidence
+    #
+    # This is a presentation metric, not a calibrated
+    # probability of being correct.
+    # --------------------------------------------------------
+
+    confidence = abs(
+        probability_up
+        - probability_down
+    )
+
+    # --------------------------------------------------------
     # REGIME
     # --------------------------------------------------------
 
@@ -434,7 +450,7 @@ def analyze_stock(
         regime = "UNKNOWN"
 
     # --------------------------------------------------------
-    # MULTI-TIMEFRAME CONTEXT
+    # MULTI-TIMEFRAME
     # --------------------------------------------------------
 
     weekly_trend = _latest_value(
@@ -467,13 +483,12 @@ def analyze_stock(
 
     signal = _generate_signal(
         probability_up=probability_up,
-        regime=regime,
         alignment=alignment,
         threshold=probability_threshold,
     )
 
     # --------------------------------------------------------
-    # PRICE
+    # CURRENT PRICE
     # --------------------------------------------------------
 
     current_price = _latest_close(
@@ -599,12 +614,12 @@ def analyze_stock(
     )
 
     # --------------------------------------------------------
-    # RESULT OBJECT
+    # RESULT
     # --------------------------------------------------------
 
     result = PredictionResult()
 
-    # Core fields.
+    # Core prediction.
     result.signal = signal
 
     result.probability_up = (
@@ -619,6 +634,9 @@ def analyze_stock(
         probability_up
     )
 
+    # Compatibility field expected by UI.
+    result.confidence = confidence
+
     result.horizon = horizon
 
     result.current_price = (
@@ -627,6 +645,7 @@ def analyze_stock(
 
     result.price = current_price
 
+    # Regime.
     result.regime = regime
 
     # Multi-timeframe.
@@ -689,10 +708,8 @@ def analyze_stock(
         model.feature_names_
     )
 
-    # Full feature data.
     result.features = features
 
-    # Model.
     result.model = model
 
     return result
@@ -709,4 +726,4 @@ __all__ = [
     "PredictionResult",
     "analyze_stock",
     "predict_stock",
-  ]
+]
