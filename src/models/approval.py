@@ -8,35 +8,39 @@ research and robustness gates before it can be used for live inference.
 
 Approval philosophy
 -------------------
-A model is NOT production-ready merely because:
+A financial ML model should NOT be approved merely because its accuracy
+is high.
 
-    accuracy >= 95%
-
-Instead, approval requires evidence across:
+Approval should consider evidence across:
 
     1. Validation
     2. Final holdout
-    3. Leakage checks
-    4. Probability calibration
-    5. Target-range validation
-    6. Regime stability
-    7. Trading backtest
-    8. Robustness
+    3. Generalization gap
+    4. Leakage checks
+    5. Probability calibration
+    6. Target-range validation
+    7. Regime stability
+    8. Trading backtest
+    9. Robustness
+   10. Economic edge
 
 The final holdout must remain untouched until the research configuration
 has been frozen.
 
 A failed critical gate results in REJECTED status.
 
-A warning does not automatically reject a model, but should be visible
-to the researcher.
+Missing required evidence results in HOLD.
+
+Warnings are visible but do not automatically reject a model.
+
+This module does not train models.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
 
@@ -47,30 +51,20 @@ import numpy as np
 
 
 class ApprovalStatus(str, Enum):
-    """
-    Final model lifecycle state.
-    """
+    """Final model lifecycle state."""
 
     APPROVED = "APPROVED"
-
     RESEARCH = "RESEARCH"
-
     REJECTED = "REJECTED"
-
     HOLD = "HOLD"
 
 
 class GateStatus(str, Enum):
-    """
-    Individual gate result.
-    """
+    """Individual approval-gate status."""
 
     PASS = "PASS"
-
     FAIL = "FAIL"
-
     WARNING = "WARNING"
-
     NOT_EVALUATED = "NOT_EVALUATED"
 
 
@@ -118,29 +112,90 @@ class ApprovalGate:
 @dataclass
 class ApprovalConfig:
     """
-    Final approval thresholds.
+    Production approval thresholds.
 
-    These values are deliberately conservative starting points.
+    These are starting research thresholds, not guarantees of future
+    profitability.
 
-    They should be evaluated empirically rather than assumed to guarantee
-    future performance.
+    Accuracy is retained for backward compatibility, but should not be
+    treated as the primary measure of a financial model.
+
+    The research pipeline should increasingly emphasize:
+
+        balanced accuracy
+        ROC-AUC
+        PR-AUC
+        log loss
+        Brier score
+        calibration
+        walk-forward performance
+        trading expectancy
+        profit factor
+        drawdown
+        robustness
+        economic edge
     """
 
-    minimum_validation_accuracy: float = 0.95
+    # --------------------------------------------------------------
+    # Classification validation
+    # --------------------------------------------------------------
 
-    minimum_final_holdout_accuracy: float = 0.95
+    minimum_validation_accuracy: float = 0.60
+
+    minimum_final_holdout_accuracy: float = 0.60
 
     maximum_validation_holdout_gap: float = 0.10
+
+    # Optional stronger metrics.
+    minimum_validation_balanced_accuracy: Optional[
+        float
+    ] = None
+
+    minimum_final_holdout_balanced_accuracy: Optional[
+        float
+    ] = None
+
+    minimum_validation_roc_auc: Optional[
+        float
+    ] = None
+
+    minimum_final_holdout_roc_auc: Optional[
+        float
+    ] = None
+
+    minimum_validation_pr_auc: Optional[
+        float
+    ] = None
+
+    minimum_final_holdout_pr_auc: Optional[
+        float
+    ] = None
+
+    # --------------------------------------------------------------
+    # Calibration
+    # --------------------------------------------------------------
 
     maximum_calibration_brier: float = 0.25
 
     maximum_calibration_ece: float = 0.15
 
+    # --------------------------------------------------------------
+    # Range prediction
+    # --------------------------------------------------------------
+
     minimum_range_coverage: float = 0.70
 
     maximum_range_coverage: float = 0.95
 
+    # --------------------------------------------------------------
+    # Regime
+    # --------------------------------------------------------------
+
     minimum_regime_stability: float = 0.60
+
+    # --------------------------------------------------------------
+    # Backtest
+    # --------------------------------------------------------------
 
     minimum_backtest_profit_factor: float = 1.20
 
@@ -150,7 +205,23 @@ class ApprovalConfig:
 
     minimum_backtest_trades: int = 30
 
+    # --------------------------------------------------------------
+    # Robustness
+    # --------------------------------------------------------------
+
     minimum_robustness_score: float = 0.60
+
+    # --------------------------------------------------------------
+    # Economic edge
+    # --------------------------------------------------------------
+
+    minimum_expected_edge: float = 0.003
+
+    require_expected_edge: bool = False
+
+    # --------------------------------------------------------------
+    # Required gates
+    # --------------------------------------------------------------
 
     require_validation: bool = True
 
@@ -168,75 +239,87 @@ class ApprovalConfig:
 
     require_robustness: bool = True
 
+    # --------------------------------------------------------------
+    # General
+    # --------------------------------------------------------------
+
     allow_warnings: bool = True
 
     def __post_init__(self) -> None:
-        probabilities = [
+        bounded_values = [
             self.minimum_validation_accuracy,
             self.minimum_final_holdout_accuracy,
-            self.minimum_range_coverage,
-            self.maximum_range_coverage,
             self.maximum_calibration_brier,
             self.maximum_calibration_ece,
+            self.minimum_range_coverage,
+            self.maximum_range_coverage,
             self.minimum_regime_stability,
             self.maximum_backtest_drawdown,
             self.minimum_robustness_score,
         ]
 
-        if any(
-            not 0.0 <= value <= 1.0
-            for value in probabilities
-        ):
-            raise ValueError(
-                "Probability/ratio thresholds must be between 0 and 1."
-            )
+        optional_bounded_values = [
+            self.minimum_validation_balanced_accuracy,
+            self.minimum_final_holdout_balanced_accuracy,
+            self.minimum_validation_roc_auc,
+            self.minimum_final_holdout_roc_auc,
+            self.minimum_validation_pr_auc,
+            self.minimum_final_holdout_pr_auc,
+        ]
 
-        if (
-            self.minimum_validation_accuracy
-            > 1.0
-        ):
-            raise ValueError(
-                "Invalid validation accuracy threshold."
-            )
+        for value in bounded_values:
 
-        if (
-            self.maximum_validation_holdout_gap
-            < 0.0
-        ):
-            raise ValueError(
-                "Validation/holdout gap cannot be negative."
-            )
+            if not 0.0 <= float(value) <= 1.0:
+                raise ValueError(
+                    "Probability/ratio thresholds must be between 0 and 1."
+                )
+
+        for value in optional_bounded_values:
+
+            if value is not None:
+
+                if not 0.0 <= float(value) <= 1.0:
+                    raise ValueError(
+                        "Optional metric thresholds must be between 0 and 1."
+                    )
 
         if (
             self.minimum_range_coverage
             > self.maximum_range_coverage
         ):
             raise ValueError(
-                "Invalid range coverage thresholds."
+                "minimum_range_coverage cannot exceed "
+                "maximum_range_coverage."
             )
 
-        if (
-            self.minimum_backtest_profit_factor
-            < 0
-        ):
+        if self.maximum_validation_holdout_gap < 0:
+
             raise ValueError(
-                "Profit-factor threshold cannot be negative."
+                "maximum_validation_holdout_gap cannot be negative."
             )
 
-        if (
-            self.minimum_backtest_sharpe
-            < 0
-        ):
+        if self.minimum_backtest_profit_factor < 0:
+
             raise ValueError(
-                "Sharpe threshold cannot be negative."
+                "minimum_backtest_profit_factor cannot be negative."
             )
 
-        if (
-            self.minimum_backtest_trades
-            < 1
-        ):
+        if self.minimum_backtest_sharpe < 0:
+
+            raise ValueError(
+                "minimum_backtest_sharpe cannot be negative."
+            )
+
+        if self.minimum_backtest_trades < 1:
+
             raise ValueError(
                 "minimum_backtest_trades must be positive."
+            )
+
+        if self.minimum_expected_edge < 0:
+
+            raise ValueError(
+                "minimum_expected_edge cannot be negative."
             )
 
 
@@ -247,15 +330,11 @@ class ApprovalConfig:
 
 @dataclass
 class ApprovalReport:
-    """
-    Complete production approval report.
-    """
+    """Complete production approval report."""
 
     status: ApprovalStatus
 
-    gates: list[
-        ApprovalGate
-    ]
+    gates: list[ApprovalGate]
 
     critical_failures: list[str]
 
@@ -288,6 +367,8 @@ class ApprovalReport:
         return self.status == ApprovalStatus.REJECTED
 
     def summary(self) -> Dict[str, Any]:
+        """Return a compact serializable summary."""
+
         return {
             "status": self.status.value,
             "approved": self.approved,
@@ -299,28 +380,31 @@ class ApprovalReport:
             "not_evaluated_gates": (
                 self.not_evaluated_gates
             ),
-            "critical_failures": (
+            "critical_failures": list(
                 self.critical_failures
             ),
-            "warnings": self.warnings,
+            "warnings": list(
+                self.warnings
+            ),
             "model_id": self.model_id,
             "experiment_id": self.experiment_id,
         }
 
 
 # ----------------------------------------------------------------------
-# Approval engine
+# Production approval engine
 # ----------------------------------------------------------------------
 
 
 class ProductionApprovalEngine:
     """
-    Final approval decision engine.
+    Final production approval engine.
 
-    Each gate is independently evaluated.
+    Every gate is evaluated independently.
 
-    Critical gates cannot be bypassed simply because the aggregate score
-    is high.
+    Critical gates cannot be bypassed by a high aggregate score.
+
+    This class never trains a model.
     """
 
     def __init__(
@@ -329,6 +413,7 @@ class ProductionApprovalEngine:
             ApprovalConfig
         ] = None,
     ) -> None:
+
         self.config = (
             config
             or ApprovalConfig()
@@ -343,6 +428,12 @@ class ProductionApprovalEngine:
         *,
         validation_accuracy: Optional[float] = None,
         final_holdout_accuracy: Optional[float] = None,
+        validation_balanced_accuracy: Optional[float] = None,
+        final_holdout_balanced_accuracy: Optional[float] = None,
+        validation_roc_auc: Optional[float] = None,
+        final_holdout_roc_auc: Optional[float] = None,
+        validation_pr_auc: Optional[float] = None,
+        final_holdout_pr_auc: Optional[float] = None,
         leakage_free: Optional[bool] = None,
         calibration_brier: Optional[float] = None,
         calibration_ece: Optional[float] = None,
@@ -353,6 +444,7 @@ class ProductionApprovalEngine:
         backtest_max_drawdown: Optional[float] = None,
         backtest_trade_count: Optional[int] = None,
         robustness_score: Optional[float] = None,
+        expected_edge: Optional[float] = None,
         validation_passed: Optional[bool] = None,
         calibration_passed: Optional[bool] = None,
         range_passed: Optional[bool] = None,
@@ -362,12 +454,18 @@ class ProductionApprovalEngine:
         model_id: Optional[str] = None,
         experiment_id: Optional[str] = None,
     ) -> ApprovalReport:
-        gates: list[
-            ApprovalGate
-        ] = []
+        """
+        Evaluate all production-readiness gates.
+
+        Parameters are optional because research can happen incrementally.
+        Missing required evidence produces HOLD/REJECTED rather than
+        pretending that the model passed.
+        """
+
+        gates: list[ApprovalGate] = []
 
         # --------------------------------------------------------------
-        # Validation
+        # 1. Validation accuracy
         # --------------------------------------------------------------
 
         gates.append(
@@ -375,18 +473,15 @@ class ProductionApprovalEngine:
                 name="validation_accuracy",
                 value=validation_accuracy,
                 threshold=(
-                    self.config
-                    .minimum_validation_accuracy
+                    self.config.minimum_validation_accuracy
                 ),
-                passed_override=(
-                    validation_passed
-                ),
+                passed_override=validation_passed,
                 critical=self.config.require_validation,
             )
         )
 
         # --------------------------------------------------------------
-        # Final holdout
+        # 2. Final holdout accuracy
         # --------------------------------------------------------------
 
         gates.append(
@@ -394,30 +489,147 @@ class ProductionApprovalEngine:
                 name="final_holdout_accuracy",
                 value=final_holdout_accuracy,
                 threshold=(
-                    self.config
-                    .minimum_final_holdout_accuracy
+                    self.config.minimum_final_holdout_accuracy
                 ),
                 critical=self.config.require_final_holdout,
             )
         )
 
         # --------------------------------------------------------------
-        # Generalization gap
+        # 3. Generalization gap
         # --------------------------------------------------------------
 
         gates.append(
             self._generalization_gate(
-                validation_accuracy=(
-                    validation_accuracy
-                ),
-                holdout_accuracy=(
-                    final_holdout_accuracy
-                ),
+                validation_accuracy=validation_accuracy,
+                holdout_accuracy=final_holdout_accuracy,
             )
         )
 
         # --------------------------------------------------------------
-        # Leakage
+        # 4. Balanced accuracy
+        # --------------------------------------------------------------
+
+        if (
+            self.config
+            .minimum_validation_balanced_accuracy
+            is not None
+        ):
+
+            gates.append(
+                self._threshold_gate(
+                    name="validation_balanced_accuracy",
+                    value=validation_balanced_accuracy,
+                    threshold=(
+                        self.config
+                        .minimum_validation_balanced_accuracy
+                    ),
+                    direction="min",
+                    critical=self.config.require_validation,
+                )
+            )
+
+        if (
+            self.config
+            .minimum_final_holdout_balanced_accuracy
+            is not None
+        ):
+
+            gates.append(
+                self._threshold_gate(
+                    name="final_holdout_balanced_accuracy",
+                    value=final_holdout_balanced_accuracy,
+                    threshold=(
+                        self.config
+                        .minimum_final_holdout_balanced_accuracy
+                    ),
+                    direction="min",
+                    critical=self.config.require_final_holdout,
+                )
+            )
+
+        # --------------------------------------------------------------
+        # 5. ROC-AUC
+        # --------------------------------------------------------------
+
+        if (
+            self.config.minimum_validation_roc_auc
+            is not None
+        ):
+
+            gates.append(
+                self._threshold_gate(
+                    name="validation_roc_auc",
+                    value=validation_roc_auc,
+                    threshold=(
+                        self.config
+                        .minimum_validation_roc_auc
+                    ),
+                    direction="min",
+                    critical=self.config.require_validation,
+                )
+            )
+
+        if (
+            self.config.minimum_final_holdout_roc_auc
+            is not None
+        ):
+
+            gates.append(
+                self._threshold_gate(
+                    name="final_holdout_roc_auc",
+                    value=final_holdout_roc_auc,
+                    threshold=(
+                        self.config
+                        .minimum_final_holdout_roc_auc
+                    ),
+                    direction="min",
+                    critical=self.config.require_final_holdout,
+                )
+            )
+
+        # --------------------------------------------------------------
+        # 6. PR-AUC
+        # --------------------------------------------------------------
+
+        if (
+            self.config.minimum_validation_pr_auc
+            is not None
+        ):
+
+            gates.append(
+                self._threshold_gate(
+                    name="validation_pr_auc",
+                    value=validation_pr_auc,
+                    threshold=(
+                        self.config
+                        .minimum_validation_pr_auc
+                    ),
+                    direction="min",
+                    critical=self.config.require_validation,
+                )
+            )
+
+        if (
+            self.config.minimum_final_holdout_pr_auc
+            is not None
+        ):
+
+            gates.append(
+                self._threshold_gate(
+                    name="final_holdout_pr_auc",
+                    value=final_holdout_pr_auc,
+                    threshold=(
+                        self.config
+                        .minimum_final_holdout_pr_auc
+                    ),
+                    direction="min",
+                    critical=self.config.require_final_holdout,
+                )
+            )
+
+        # --------------------------------------------------------------
+        # 7. Leakage
         # --------------------------------------------------------------
 
         gates.append(
@@ -429,7 +641,7 @@ class ProductionApprovalEngine:
         )
 
         # --------------------------------------------------------------
-        # Calibration
+        # 8. Calibration
         # --------------------------------------------------------------
 
         gates.append(
@@ -459,6 +671,7 @@ class ProductionApprovalEngine:
         )
 
         if calibration_passed is not None:
+
             gates.append(
                 self._boolean_gate(
                     name="calibration_pipeline",
@@ -468,7 +681,7 @@ class ProductionApprovalEngine:
             )
 
         # --------------------------------------------------------------
-        # Range
+        # 9. Range validation
         # --------------------------------------------------------------
 
         gates.append(
@@ -479,7 +692,7 @@ class ProductionApprovalEngine:
         )
 
         # --------------------------------------------------------------
-        # Regime stability
+        # 10. Regime stability
         # --------------------------------------------------------------
 
         gates.append(
@@ -496,6 +709,7 @@ class ProductionApprovalEngine:
         )
 
         if regime_passed is not None:
+
             gates.append(
                 self._boolean_gate(
                     name="regime_validation",
@@ -505,7 +719,7 @@ class ProductionApprovalEngine:
             )
 
         # --------------------------------------------------------------
-        # Backtest
+        # 11. Backtest profit factor
         # --------------------------------------------------------------
 
         gates.append(
@@ -521,6 +735,10 @@ class ProductionApprovalEngine:
             )
         )
 
+        # --------------------------------------------------------------
+        # 12. Backtest Sharpe
+        # --------------------------------------------------------------
+
         gates.append(
             self._threshold_gate(
                 name="backtest_sharpe",
@@ -534,6 +752,10 @@ class ProductionApprovalEngine:
             )
         )
 
+        # --------------------------------------------------------------
+        # 13. Backtest drawdown
+        # --------------------------------------------------------------
+
         gates.append(
             self._threshold_gate(
                 name="backtest_max_drawdown",
@@ -546,6 +768,10 @@ class ProductionApprovalEngine:
                 critical=self.config.require_backtest,
             )
         )
+
+        # --------------------------------------------------------------
+        # 14. Number of trades
+        # --------------------------------------------------------------
 
         gates.append(
             self._threshold_gate(
@@ -565,6 +791,7 @@ class ProductionApprovalEngine:
         )
 
         if backtest_passed is not None:
+
             gates.append(
                 self._boolean_gate(
                     name="backtest_pipeline",
@@ -574,7 +801,7 @@ class ProductionApprovalEngine:
             )
 
         # --------------------------------------------------------------
-        # Robustness
+        # 15. Robustness
         # --------------------------------------------------------------
 
         gates.append(
@@ -591,6 +818,7 @@ class ProductionApprovalEngine:
         )
 
         if robustness_passed is not None:
+
             gates.append(
                 self._boolean_gate(
                     name="robustness_pipeline",
@@ -600,7 +828,17 @@ class ProductionApprovalEngine:
             )
 
         # --------------------------------------------------------------
-        # Final decision
+        # 16. Economic edge
+        # --------------------------------------------------------------
+
+        gates.append(
+            self._edge_gate(
+                expected_edge=expected_edge
+            )
+        )
+
+        # --------------------------------------------------------------
+        # Final report
         # --------------------------------------------------------------
 
         return self._build_report(
@@ -622,7 +860,16 @@ class ProductionApprovalEngine:
         passed_override: Optional[bool] = None,
         critical: bool = True,
     ) -> ApprovalGate:
+        """
+        Evaluate an accuracy metric.
+
+        An explicit pipeline result takes precedence over the numeric
+        value because the pipeline may incorporate additional validation
+        logic.
+        """
+
         if passed_override is not None:
+
             return ApprovalGate(
                 name=name,
                 status=(
@@ -633,40 +880,42 @@ class ProductionApprovalEngine:
                 value=value,
                 threshold=threshold,
                 message=(
-                    "Pipeline gate passed."
+                    "Validation pipeline gate passed."
                     if passed_override
-                    else "Pipeline gate failed."
+                    else "Validation pipeline gate failed."
                 ),
                 critical=critical,
             )
 
         if value is None:
+
             return ApprovalGate(
                 name=name,
                 status=GateStatus.NOT_EVALUATED,
                 value=None,
                 threshold=threshold,
                 message=(
-                    "Metric was not supplied."
+                    f"{name} was not supplied."
                 ),
                 critical=critical,
             )
 
+        value = float(value)
+
         if not np.isfinite(value):
+
             return ApprovalGate(
                 name=name,
                 status=GateStatus.FAIL,
                 value=value,
                 threshold=threshold,
                 message=(
-                    "Metric is not finite."
+                    f"{name} is not finite."
                 ),
                 critical=critical,
             )
 
-        passed = (
-            value >= threshold
-        )
+        passed = value >= threshold
 
         return ApprovalGate(
             name=name,
@@ -675,12 +924,11 @@ class ProductionApprovalEngine:
                 if passed
                 else GateStatus.FAIL
             ),
-            value=float(value),
+            value=value,
             threshold=threshold,
             message=(
-                f"Accuracy {value:.4f} "
-                f"{'meets' if passed else 'does not meet'} "
-                f"required {threshold:.4f}."
+                f"{name} = {value:.4f}; "
+                f"required >= {threshold:.4f}."
             ),
             critical=critical,
         )
@@ -695,10 +943,18 @@ class ProductionApprovalEngine:
         validation_accuracy: Optional[float],
         holdout_accuracy: Optional[float],
     ) -> ApprovalGate:
+        """
+        Check validation-to-final-holdout degradation.
+
+        This prevents a model from appearing strong during research but
+        collapsing on the untouched holdout.
+        """
+
         if (
             validation_accuracy is None
             or holdout_accuracy is None
         ):
+
             return ApprovalGate(
                 name="generalization_gap",
                 status=GateStatus.NOT_EVALUATED,
@@ -708,7 +964,36 @@ class ProductionApprovalEngine:
                     .maximum_validation_holdout_gap
                 ),
                 message=(
-                    "Validation and holdout accuracy are required."
+                    "Both validation and final holdout "
+                    "accuracy are required."
+                ),
+                critical=True,
+            )
+
+        validation_accuracy = float(
+            validation_accuracy
+        )
+
+        holdout_accuracy = float(
+            holdout_accuracy
+        )
+
+        if not np.isfinite(
+            validation_accuracy
+        ) or not np.isfinite(
+            holdout_accuracy
+        ):
+
+            return ApprovalGate(
+                name="generalization_gap",
+                status=GateStatus.FAIL,
+                value=None,
+                threshold=(
+                    self.config
+                    .maximum_validation_holdout_gap
+                ),
+                message=(
+                    "Validation or holdout accuracy is not finite."
                 ),
                 critical=True,
             )
@@ -737,7 +1022,9 @@ class ProductionApprovalEngine:
                 .maximum_validation_holdout_gap
             ),
             message=(
-                f"Validation/holdout gap = {gap:.4f}."
+                f"Validation/holdout accuracy gap = "
+                f"{gap:.4f}; maximum allowed = "
+                f"{self.config.maximum_validation_holdout_gap:.4f}."
             ),
             critical=True,
         )
@@ -753,41 +1040,50 @@ class ProductionApprovalEngine:
         value: Optional[bool],
         critical: bool,
     ) -> ApprovalGate:
+        """
+        Evaluate a boolean research gate.
+
+        None means the gate has not been evaluated.
+        """
+
         if value is None:
+
             return ApprovalGate(
                 name=name,
                 status=GateStatus.NOT_EVALUATED,
                 value=None,
                 threshold=None,
                 message=(
-                    "Boolean gate was not evaluated."
+                    f"{name} was not evaluated."
                 ),
                 critical=critical,
             )
+
+        passed = bool(value)
 
         return ApprovalGate(
             name=name,
             status=(
                 GateStatus.PASS
-                if value
+                if passed
                 else GateStatus.FAIL
             ),
             value=(
                 1.0
-                if value
+                if passed
                 else 0.0
             ),
             threshold=1.0,
             message=(
-                "Gate passed."
-                if value
-                else "Gate failed."
+                f"{name} passed."
+                if passed
+                else f"{name} failed."
             ),
             critical=critical,
         )
 
     # ------------------------------------------------------------------
-    # Numeric threshold
+    # Numeric threshold gate
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -799,14 +1095,30 @@ class ProductionApprovalEngine:
         direction: str,
         critical: bool,
     ) -> ApprovalGate:
+        """
+        Evaluate a numeric threshold.
+
+        direction:
+
+            min
+                value >= threshold
+
+            max
+                value <= threshold
+
+            max_absolute
+                abs(value) <= threshold
+        """
+
         if value is None:
+
             return ApprovalGate(
                 name=name,
                 status=GateStatus.NOT_EVALUATED,
                 value=None,
                 threshold=threshold,
                 message=(
-                    "Metric was not supplied."
+                    f"{name} was not supplied."
                 ),
                 critical=critical,
             )
@@ -814,34 +1126,34 @@ class ProductionApprovalEngine:
         value = float(value)
 
         if not np.isfinite(value):
+
             return ApprovalGate(
                 name=name,
                 status=GateStatus.FAIL,
                 value=value,
                 threshold=threshold,
                 message=(
-                    "Metric is not finite."
+                    f"{name} is not finite."
                 ),
                 critical=critical,
             )
 
+        threshold = float(threshold)
+
         if direction == "min":
-            passed = (
-                value >= threshold
-            )
+
+            passed = value >= threshold
 
         elif direction == "max":
-            passed = (
-                value <= threshold
-            )
+
+            passed = value <= threshold
 
         elif direction == "max_absolute":
-            passed = (
-                abs(value)
-                <= threshold
-            )
+
+            passed = abs(value) <= threshold
 
         else:
+
             raise ValueError(
                 f"Unknown threshold direction: {direction}"
             )
@@ -856,14 +1168,14 @@ class ProductionApprovalEngine:
             value=value,
             threshold=threshold,
             message=(
-                f"{name}: {value:.4f}; "
+                f"{name} = {value:.4f}; "
                 f"required {direction} {threshold:.4f}."
             ),
             critical=critical,
         )
 
     # ------------------------------------------------------------------
-    # Range gate
+    # Range validation
     # ------------------------------------------------------------------
 
     def _range_gate(
@@ -872,7 +1184,16 @@ class ProductionApprovalEngine:
         range_coverage: Optional[float],
         range_passed: Optional[bool],
     ) -> ApprovalGate:
+        """
+        Evaluate prediction interval coverage.
+
+        Coverage that is unrealistically close to 100% is also rejected
+        by the upper bound because a uselessly wide interval can have
+        excellent coverage without providing useful information.
+        """
+
         if range_passed is not None:
+
             return ApprovalGate(
                 name="range_validation",
                 status=(
@@ -886,14 +1207,15 @@ class ProductionApprovalEngine:
                     .minimum_range_coverage
                 ),
                 message=(
-                    "Range validation passed."
+                    "Range validation pipeline passed."
                     if range_passed
-                    else "Range validation failed."
+                    else "Range validation pipeline failed."
                 ),
                 critical=self.config.require_range_validation,
             )
 
         if range_coverage is None:
+
             return ApprovalGate(
                 name="range_validation",
                 status=GateStatus.NOT_EVALUATED,
@@ -908,12 +1230,30 @@ class ProductionApprovalEngine:
                 critical=self.config.require_range_validation,
             )
 
+        coverage = float(
+            range_coverage
+        )
+
+        if not np.isfinite(coverage):
+
+            return ApprovalGate(
+                name="range_validation",
+                status=GateStatus.FAIL,
+                value=coverage,
+                threshold=(
+                    self.config
+                    .minimum_range_coverage
+                ),
+                message=(
+                    "Range coverage is not finite."
+                ),
+                critical=self.config.require_range_validation,
+            )
+
         passed = (
-            self.config
-            .minimum_range_coverage
-            <= range_coverage
-            <= self.config
-            .maximum_range_coverage
+            self.config.minimum_range_coverage
+            <= coverage
+            <= self.config.maximum_range_coverage
         )
 
         return ApprovalGate(
@@ -923,25 +1263,143 @@ class ProductionApprovalEngine:
                 if passed
                 else GateStatus.FAIL
             ),
-            value=float(
-                range_coverage
-            ),
+            value=coverage,
             threshold=(
                 self.config
                 .minimum_range_coverage
             ),
             message=(
-                f"Range coverage = {range_coverage:.4f}; "
-                f"accepted interval is "
-                f"{self.config.minimum_range_coverage:.2f} "
+                f"Range coverage = {coverage:.2%}; "
+                f"accepted interval = "
+                f"{self.config.minimum_range_coverage:.2%} "
                 f"to "
-                f"{self.config.maximum_range_coverage:.2f}."
+                f"{self.config.maximum_range_coverage:.2%}."
             ),
             critical=self.config.require_range_validation,
         )
 
     # ------------------------------------------------------------------
-    # Report
+    # Economic edge
+    # ------------------------------------------------------------------
+
+    def _edge_gate(
+        self,
+        *,
+        expected_edge: Optional[float],
+    ) -> ApprovalGate:
+        """
+        Evaluate expected economic edge.
+
+        expected_edge is a decimal return:
+
+            0.010 = +1.0%
+            0.025 = +2.5%
+            -0.005 = -0.5%
+
+        The gate is optional at this stage.
+
+        This is intentional: we do not want to fabricate expected
+        returns before the return-prediction layer has been properly
+        implemented and validated.
+        """
+
+        if expected_edge is None:
+
+            if self.config.require_expected_edge:
+
+                return ApprovalGate(
+                    name="expected_edge",
+                    status=GateStatus.FAIL,
+                    value=None,
+                    threshold=(
+                        self.config
+                        .minimum_expected_edge
+                    ),
+                    message=(
+                        "Expected economic edge is required "
+                        "but was not supplied."
+                    ),
+                    critical=True,
+                )
+
+            return ApprovalGate(
+                name="expected_edge",
+                status=GateStatus.NOT_EVALUATED,
+                value=None,
+                threshold=(
+                    self.config
+                    .minimum_expected_edge
+                ),
+                message=(
+                    "Expected economic edge is not available; "
+                    "economic edge gate is currently optional."
+                ),
+                critical=False,
+            )
+
+        edge = float(
+            expected_edge
+        )
+
+        if not np.isfinite(edge):
+
+            return ApprovalGate(
+                name="expected_edge",
+                status=GateStatus.FAIL,
+                value=edge,
+                threshold=(
+                    self.config
+                    .minimum_expected_edge
+                ),
+                message=(
+                    "Expected economic edge is not finite."
+                ),
+                critical=self.config.require_expected_edge,
+            )
+
+        threshold = float(
+            self.config.minimum_expected_edge
+        )
+
+        passed = edge >= threshold
+
+        score = (
+            max(
+                0.0,
+                min(
+                    1.0,
+                    edge / threshold,
+                ),
+            )
+            if threshold > 0
+            else (
+                1.0
+                if edge >= 0
+                else 0.0
+            )
+        )
+
+        return ApprovalGate(
+            name="expected_edge",
+            status=(
+                GateStatus.PASS
+                if passed
+                else GateStatus.FAIL
+            ),
+            value=edge,
+            threshold=threshold,
+            message=(
+                f"Expected net edge = {edge:.2%}; "
+                f"required >= {threshold:.2%}."
+            ),
+            critical=self.config.require_expected_edge,
+            evidence={
+                "edge_score": score,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Report generation
     # ------------------------------------------------------------------
 
     def _build_report(
@@ -953,27 +1411,30 @@ class ProductionApprovalEngine:
         model_id: Optional[str],
         experiment_id: Optional[str],
     ) -> ApprovalReport:
-        gates = list(gates)
+        """
+        Aggregate all gates into the final lifecycle status.
+        """
+
+        gates = list(
+            gates
+        )
 
         passed = [
             gate
             for gate in gates
-            if gate.status
-            == GateStatus.PASS
+            if gate.status == GateStatus.PASS
         ]
 
         failed = [
             gate
             for gate in gates
-            if gate.status
-            == GateStatus.FAIL
+            if gate.status == GateStatus.FAIL
         ]
 
         warnings = [
             gate
             for gate in gates
-            if gate.status
-            == GateStatus.WARNING
+            if gate.status == GateStatus.WARNING
         ]
 
         not_evaluated = [
@@ -982,6 +1443,10 @@ class ProductionApprovalEngine:
             if gate.status
             == GateStatus.NOT_EVALUATED
         ]
+
+        # --------------------------------------------------------------
+        # Critical failures
+        # --------------------------------------------------------------
 
         critical_failures = [
             gate.name
@@ -1000,7 +1465,7 @@ class ProductionApprovalEngine:
         ]
 
         # --------------------------------------------------------------
-        # Score
+        # Aggregate score
         # --------------------------------------------------------------
 
         evaluated = [
@@ -1014,65 +1479,77 @@ class ProductionApprovalEngine:
         ]
 
         if evaluated:
+
             score = float(
                 len(passed)
                 / len(evaluated)
             )
+
         else:
+
             score = 0.0
 
         # --------------------------------------------------------------
-        # Status
+        # Final lifecycle status
         # --------------------------------------------------------------
 
         if critical_failures:
-            status = (
-                ApprovalStatus.REJECTED
-            )
+
+            status = ApprovalStatus.REJECTED
 
         elif not_evaluated:
-            status = (
-                ApprovalStatus.HOLD
-            )
 
-        elif warnings and not (
-            self.config.allow_warnings
+            status = ApprovalStatus.HOLD
+
+        elif (
+            warnings
+            and not self.config.allow_warnings
         ):
-            status = (
-                ApprovalStatus.REJECTED
-            )
+
+            status = ApprovalStatus.REJECTED
 
         else:
-            status = (
-                ApprovalStatus.APPROVED
-            )
+
+            status = ApprovalStatus.APPROVED
+
+        # --------------------------------------------------------------
+        # Notes
+        # --------------------------------------------------------------
 
         notes = [
             (
-                "Approval requires evidence across multiple "
-                "independent research gates."
+                "Production approval requires evidence across "
+                "multiple independent research gates."
             ),
             (
-                "A high accuracy value alone cannot approve a model."
+                "Classification accuracy alone is not sufficient "
+                "evidence of financial-model quality."
             ),
             (
-                "The final holdout must remain untouched until "
+                "Final holdout data must remain untouched until "
                 "the research configuration is frozen."
+            ),
+            (
+                "Economic performance should ultimately be judged "
+                "using leakage-free walk-forward trading results."
             ),
         ]
 
         if status == ApprovalStatus.APPROVED:
+
             notes.append(
                 "Model passed all required production gates."
             )
 
         elif status == ApprovalStatus.HOLD:
+
             notes.append(
-                "Model is on HOLD because required evidence "
+                "Model remains on HOLD because required evidence "
                 "has not yet been evaluated."
             )
 
-        else:
+        elif status == ApprovalStatus.REJECTED:
+
             notes.append(
                 "Model is not approved for production use."
             )
@@ -1080,9 +1557,7 @@ class ProductionApprovalEngine:
         return ApprovalReport(
             status=status,
             gates=gates,
-            critical_failures=(
-                critical_failures
-            ),
+            critical_failures=critical_failures,
             warnings=warning_messages,
             passed_gates=len(passed),
             failed_gates=len(failed),
@@ -1106,6 +1581,12 @@ def evaluate_production_readiness(
     *,
     validation_accuracy: Optional[float] = None,
     final_holdout_accuracy: Optional[float] = None,
+    validation_balanced_accuracy: Optional[float] = None,
+    final_holdout_balanced_accuracy: Optional[float] = None,
+    validation_roc_auc: Optional[float] = None,
+    final_holdout_roc_auc: Optional[float] = None,
+    validation_pr_auc: Optional[float] = None,
+    final_holdout_pr_auc: Optional[float] = None,
     leakage_free: Optional[bool] = None,
     calibration_brier: Optional[float] = None,
     calibration_ece: Optional[float] = None,
@@ -1116,6 +1597,7 @@ def evaluate_production_readiness(
     backtest_max_drawdown: Optional[float] = None,
     backtest_trade_count: Optional[int] = None,
     robustness_score: Optional[float] = None,
+    expected_edge: Optional[float] = None,
     validation_passed: Optional[bool] = None,
     calibration_passed: Optional[bool] = None,
     range_passed: Optional[bool] = None,
@@ -1143,13 +1625,37 @@ def evaluate_production_readiness(
         final_holdout_accuracy=(
             final_holdout_accuracy
         ),
+        validation_balanced_accuracy=(
+            validation_balanced_accuracy
+        ),
+        final_holdout_balanced_accuracy=(
+            final_holdout_balanced_accuracy
+        ),
+        validation_roc_auc=(
+            validation_roc_auc
+        ),
+        final_holdout_roc_auc=(
+            final_holdout_roc_auc
+        ),
+        validation_pr_auc=(
+            validation_pr_auc
+        ),
+        final_holdout_pr_auc=(
+            final_holdout_pr_auc
+        ),
         leakage_free=leakage_free,
         calibration_brier=(
             calibration_brier
         ),
-        calibration_ece=calibration_ece,
-        range_coverage=range_coverage,
-        regime_stability=regime_stability,
+        calibration_ece=(
+            calibration_ece
+        ),
+        range_coverage=(
+            range_coverage
+        ),
+        regime_stability=(
+            regime_stability
+        ),
         backtest_profit_factor=(
             backtest_profit_factor
         ),
@@ -1164,6 +1670,9 @@ def evaluate_production_readiness(
         ),
         robustness_score=(
             robustness_score
+        ),
+        expected_edge=(
+            expected_edge
         ),
         validation_passed=(
             validation_passed
@@ -1183,7 +1692,9 @@ def evaluate_production_readiness(
 def approval_summary(
     report: ApprovalReport,
 ) -> Dict[str, Any]:
-    """Return a compact approval summary."""
+    """
+    Return a compact approval summary.
+    """
 
     return report.summary()
 
