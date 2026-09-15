@@ -1,114 +1,26 @@
-project:
-  name: "AI Swing Analyser"
-  version: "0.1.0"
-  environment: "research"
+app:
+  name: "AI Swing Stock Analyzer"
+  default_symbol: "RELIANCE.NS"
+  default_period: "2y"
+  default_interval: "1d"
 
-market:
-  country: "India"
-  timezone: "Asia/Kolkata"
-
-  indices:
-    nifty50: "^NSEI"
-    sensex: "^BSESN"
-    nifty_bank: "^NSEBANK"
-
-timeframes:
-  primary:
-    - "4H"
-    - "1D"
-    - "1W"
-    - "1M"
-
-prediction:
-  horizons:
-    - 1
-    - 3
-    - 5
-    - 10
-    - 20
-
-  direction_threshold: 0.0
-
-validation:
-  test_fraction: 0.20
-  validation_fraction: 0.20
-
-  # Minimum acceptable directional accuracy
-  minimum_accuracy: 0.95
-
-  # These are research safeguards rather than performance claims.
-  require_walk_forward: true
-  require_out_of_sample: true
-  require_no_data_leakage: true
-  require_final_holdout: true
+strategy:
+  horizon_days: 5
+  probability_threshold: 0.60
+  high_confidence_threshold: 0.70
+  stop_loss_pct: 0.03
+  target_pct: 0.06
+  risk_per_trade: 0.01
+  transaction_cost: 0.001
+  slippage: 0.0005
+  initial_capital: 100000
 
 features:
-  rsi:
-    enabled: true
-    period: 14
-
-  macd:
-    enabled: true
-    fast: 12
-    slow: 26
-    signal: 9
-
-  ema:
-    enabled: true
-    periods:
-      - 9
-      - 20
-      - 50
-      - 100
-      - 200
-
-  sma:
-    enabled: true
-    periods:
-      - 20
-      - 50
-      - 200
-
-  bollinger_bands:
-    enabled: true
-    period: 20
-    standard_deviation: 2.0
-
-  atr:
-    enabled: true
-    period: 14
-
-  adx:
-    enabled: true
-    period: 14
-
-  stochastic:
-    enabled: true
-    period: 14
-
-  obv:
-    enabled: true
-
-  roc:
-    enabled: true
-    period: 10
-
-  volume:
-    enabled: true
-
-risk:
-  max_risk_per_trade: 0.01
-  minimum_risk_reward: 2.0
-
-model:
-  random_state: 42
-
-  logistic_regression:
-    enabled: true
-
-  random_forest:
-    enabled: true
-
-  gradient_boosting:
-    enabled: true
-
+  ema_fast: 20
+  ema_slow: 50
+  ema_long: 200
+  rsi_period: 14
+  atr_period: 14
+  adx_period: 14
+  bb_period: 20
+  volume_period: 20
