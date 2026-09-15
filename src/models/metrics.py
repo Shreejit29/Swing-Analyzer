@@ -1,18 +1,38 @@
+```python
 """
 Model evaluation metrics for AI Swing Analyser.
 
 Provides leakage-safe evaluation metrics for:
 
     - Direction classification
+    - Probability quality
     - Probability calibration
     - Return prediction
     - Price-range prediction
     - Trading-oriented performance
-    - Confidence thresholds
+    - Confidence-threshold analysis
 
-IMPORTANT:
-Metrics must be calculated on data that was not used to fit
-the model being evaluated.
+IMPORTANT
+---------
+Metrics must be calculated on observations that were not used to
+fit the model being evaluated.
+
+For financial prediction, accuracy alone is NOT sufficient.
+
+The research layer should consider:
+
+    - Balanced Accuracy
+    - ROC-AUC
+    - PR-AUC
+    - F1
+    - Log Loss
+    - Brier Score
+    - Matthews Correlation Coefficient
+    - Calibration Error
+    - Out-of-sample trading performance
+    - Drawdown
+    - Profit Factor
+    - Stability across time
 """
 
 from __future__ import annotations
@@ -25,10 +45,12 @@ import pandas as pd
 
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     balanced_accuracy_score,
     confusion_matrix,
     f1_score,
     log_loss,
+    matthews_corrcoef,
     mean_absolute_error,
     mean_squared_error,
     precision_score,
@@ -37,9 +59,14 @@ from sklearn.metrics import (
 )
 
 
+# ---------------------------------------------------------------------
+# DATA CLASSES
+# ---------------------------------------------------------------------
+
+
 @dataclass
 class ClassificationMetrics:
-    """Container for classification evaluation."""
+    """Container for binary classification evaluation."""
 
     accuracy: float
     balanced_accuracy: float
@@ -47,8 +74,11 @@ class ClassificationMetrics:
     recall: float
     f1: float
     roc_auc: float
+    pr_auc: float
     log_loss: float
     brier_score: float
+    matthews_corrcoef: float
+    expected_calibration_error: float
     samples: int
 
 
@@ -90,10 +120,15 @@ class TradingMetrics:
     trades: int
 
 
+# ---------------------------------------------------------------------
+# VALIDATION HELPERS
+# ---------------------------------------------------------------------
+
+
 def _validate_equal_length(
     *arrays: np.ndarray,
 ) -> None:
-    """Ensure arrays have equal length."""
+    """Ensure all supplied arrays have equal length."""
 
     lengths = [
         len(np.asarray(array))
@@ -109,24 +144,313 @@ def _validate_equal_length(
 def _validate_binary_target(
     y_true: np.ndarray,
 ) -> np.ndarray:
-    """Validate binary target."""
+    """
+    Validate and return a binary target.
+
+    Accepted classes:
+
+        0
+        1
+    """
 
     y_true = np.asarray(
         y_true,
         dtype=int,
     ).reshape(-1)
 
-    unique = np.unique(y_true)
+    if len(y_true) == 0:
+        raise ValueError(
+            "Classification target cannot be empty."
+        )
+
+    unique = np.unique(
+        y_true
+    )
 
     if not np.isin(
         unique,
         [0, 1],
     ).all():
+
         raise ValueError(
             "Classification target must contain only 0 and 1."
         )
 
     return y_true
+
+
+def _validate_probability(
+    probability: np.ndarray,
+) -> np.ndarray:
+    """
+    Validate and safely clip predicted probabilities.
+    """
+
+    probability = np.asarray(
+        probability,
+        dtype=float,
+    ).reshape(-1)
+
+    if len(probability) == 0:
+        raise ValueError(
+            "Predicted probabilities cannot be empty."
+        )
+
+    if not np.isfinite(
+        probability
+    ).all():
+
+        raise ValueError(
+            "Predicted probabilities contain non-finite values."
+        )
+
+    return np.clip(
+        probability,
+        0.0,
+        1.0,
+    )
+
+
+# ---------------------------------------------------------------------
+# CALIBRATION
+# ---------------------------------------------------------------------
+
+
+def expected_calibration_error(
+    y_true: np.ndarray,
+    probability: np.ndarray,
+    n_bins: int = 10,
+) -> float:
+    """
+    Calculate Expected Calibration Error (ECE).
+
+    ECE measures the difference between:
+
+        predicted probability
+
+    and:
+
+        observed frequency
+
+    across probability bins.
+
+    Lower is better.
+
+    Example
+    -------
+    If predictions with probability around 0.80 are correct
+    approximately 80% of the time, calibration is good.
+
+    Parameters
+    ----------
+    y_true:
+        Binary 0/1 outcomes.
+
+    probability:
+        Predicted probability of class 1.
+
+    n_bins:
+        Number of probability bins.
+    """
+
+    y_true = _validate_binary_target(
+        y_true
+    )
+
+    probability = _validate_probability(
+        probability
+    )
+
+    _validate_equal_length(
+        y_true,
+        probability,
+    )
+
+    if n_bins < 2:
+        raise ValueError(
+            "n_bins must be at least 2."
+        )
+
+    edges = np.linspace(
+        0.0,
+        1.0,
+        n_bins + 1,
+    )
+
+    total = len(
+        y_true
+    )
+
+    ece = 0.0
+
+    for index in range(
+        n_bins
+    ):
+
+        lower = edges[index]
+        upper = edges[index + 1]
+
+        if index == n_bins - 1:
+
+            mask = (
+                (probability >= lower)
+                & (probability <= upper)
+            )
+
+        else:
+
+            mask = (
+                (probability >= lower)
+                & (probability < upper)
+            )
+
+        count = int(
+            mask.sum()
+        )
+
+        if count == 0:
+            continue
+
+        mean_probability = float(
+            probability[mask].mean()
+        )
+
+        observed_frequency = float(
+            y_true[mask].mean()
+        )
+
+        ece += (
+            count
+            / total
+        ) * abs(
+            mean_probability
+            - observed_frequency
+        )
+
+    return float(
+        ece
+    )
+
+
+def calibration_table(
+    y_true: np.ndarray,
+    probability: np.ndarray,
+    n_bins: int = 10,
+) -> pd.DataFrame:
+    """
+    Return a probability calibration table.
+
+    Columns
+    -------
+    bin_lower
+    bin_upper
+    samples
+    mean_probability
+    observed_frequency
+    calibration_gap
+    """
+
+    y_true = _validate_binary_target(
+        y_true
+    )
+
+    probability = _validate_probability(
+        probability
+    )
+
+    _validate_equal_length(
+        y_true,
+        probability,
+    )
+
+    if n_bins < 2:
+        raise ValueError(
+            "n_bins must be at least 2."
+        )
+
+    edges = np.linspace(
+        0.0,
+        1.0,
+        n_bins + 1,
+    )
+
+    rows = []
+
+    for index in range(
+        n_bins
+    ):
+
+        lower = float(
+            edges[index]
+        )
+
+        upper = float(
+            edges[index + 1]
+        )
+
+        if index == n_bins - 1:
+
+            mask = (
+                (probability >= lower)
+                & (probability <= upper)
+            )
+
+        else:
+
+            mask = (
+                (probability >= lower)
+                & (probability < upper)
+            )
+
+        count = int(
+            mask.sum()
+        )
+
+        if count == 0:
+
+            rows.append(
+                {
+                    "bin_lower": lower,
+                    "bin_upper": upper,
+                    "samples": 0,
+                    "mean_probability": np.nan,
+                    "observed_frequency": np.nan,
+                    "calibration_gap": np.nan,
+                }
+            )
+
+            continue
+
+        mean_probability = float(
+            probability[mask].mean()
+        )
+
+        observed_frequency = float(
+            y_true[mask].mean()
+        )
+
+        rows.append(
+            {
+                "bin_lower": lower,
+                "bin_upper": upper,
+                "samples": count,
+                "mean_probability": mean_probability,
+                "observed_frequency": observed_frequency,
+                "calibration_gap": (
+                    observed_frequency
+                    - mean_probability
+                ),
+            }
+        )
+
+    return pd.DataFrame(
+        rows
+    )
+
+
+# ---------------------------------------------------------------------
+# CLASSIFICATION METRICS
+# ---------------------------------------------------------------------
 
 
 def classification_metrics(
@@ -148,33 +472,26 @@ def classification_metrics(
     threshold:
         Probability threshold used to convert probabilities
         into binary predictions.
+
+    Notes
+    -----
+    Accuracy is intentionally only one metric.
+
+    For financial classification, probability quality and
+    out-of-sample trading performance are also important.
     """
 
     y_true = _validate_binary_target(
         y_true
     )
 
-    probability = np.asarray(
-        predicted_probability,
-        dtype=float,
-    ).reshape(-1)
+    probability = _validate_probability(
+        predicted_probability
+    )
 
     _validate_equal_length(
         y_true,
         probability,
-    )
-
-    if not np.isfinite(
-        probability
-    ).all():
-        raise ValueError(
-            "Predicted probabilities contain non-finite values."
-        )
-
-    probability = np.clip(
-        probability,
-        0.0,
-        1.0,
     )
 
     if not 0.0 < threshold < 1.0:
@@ -216,9 +533,18 @@ def classification_metrics(
         zero_division=0,
     )
 
-    if len(np.unique(y_true)) == 2:
+    unique_classes = np.unique(
+        y_true
+    )
+
+    if len(unique_classes) == 2:
 
         roc_auc = roc_auc_score(
+            y_true,
+            probability,
+        )
+
+        pr_auc = average_precision_score(
             y_true,
             probability,
         )
@@ -226,6 +552,7 @@ def classification_metrics(
     else:
 
         roc_auc = float("nan")
+        pr_auc = float("nan")
 
     ll = log_loss(
         y_true,
@@ -242,19 +569,100 @@ def classification_metrics(
         )
     )
 
+    mcc = matthews_corrcoef(
+        y_true,
+        prediction,
+    )
+
+    ece = expected_calibration_error(
+        y_true,
+        probability,
+    )
+
     return ClassificationMetrics(
-        accuracy=float(accuracy),
+        accuracy=float(
+            accuracy
+        ),
         balanced_accuracy=float(
             balanced_accuracy
         ),
-        precision=float(precision),
-        recall=float(recall),
-        f1=float(f1),
-        roc_auc=float(roc_auc),
-        log_loss=float(ll),
-        brier_score=brier,
-        samples=len(y_true),
+        precision=float(
+            precision
+        ),
+        recall=float(
+            recall
+        ),
+        f1=float(
+            f1
+        ),
+        roc_auc=float(
+            roc_auc
+        ),
+        pr_auc=float(
+            pr_auc
+        ),
+        log_loss=float(
+            ll
+        ),
+        brier_score=float(
+            brier
+        ),
+        matthews_corrcoef=float(
+            mcc
+        ),
+        expected_calibration_error=float(
+            ece
+        ),
+        samples=len(
+            y_true
+        ),
     )
+
+
+def classification_research_metrics(
+    y_true: np.ndarray,
+    predicted_probability: np.ndarray,
+    threshold: float = 0.50,
+) -> dict[str, float]:
+    """
+    Return classification metrics as a flat dictionary.
+
+    This format is convenient for:
+
+        - pandas DataFrames
+        - Streamlit
+        - CSV logging
+        - experiment tracking
+        - model comparison
+
+    The dictionary deliberately contains both traditional
+    classification metrics and probability-quality metrics.
+    """
+
+    result = classification_metrics(
+        y_true=y_true,
+        predicted_probability=predicted_probability,
+        threshold=threshold,
+    )
+
+    return {
+        "accuracy": result.accuracy,
+        "balanced_accuracy": result.balanced_accuracy,
+        "precision": result.precision,
+        "recall": result.recall,
+        "f1": result.f1,
+        "roc_auc": result.roc_auc,
+        "pr_auc": result.pr_auc,
+        "log_loss": result.log_loss,
+        "brier_score": result.brier_score,
+        "matthews_corrcoef": result.matthews_corrcoef,
+        "expected_calibration_error": (
+            result.expected_calibration_error
+        ),
+        "samples": float(
+            result.samples
+        ),
+    }
 
 
 def confusion_matrix_dataframe(
@@ -262,21 +670,27 @@ def confusion_matrix_dataframe(
     predicted_probability: np.ndarray,
     threshold: float = 0.50,
 ) -> pd.DataFrame:
-    """Return confusion matrix as a labelled dataframe."""
+    """
+    Return confusion matrix as a labelled dataframe.
+    """
 
     y_true = _validate_binary_target(
         y_true
     )
 
-    probability = np.asarray(
-        predicted_probability,
-        dtype=float,
-    ).reshape(-1)
+    probability = _validate_probability(
+        predicted_probability
+    )
 
     _validate_equal_length(
         y_true,
         probability,
     )
+
+    if not 0.0 < threshold < 1.0:
+        raise ValueError(
+            "threshold must be between 0 and 1."
+        )
 
     prediction = (
         probability >= threshold
@@ -301,11 +715,18 @@ def confusion_matrix_dataframe(
     )
 
 
+# ---------------------------------------------------------------------
+# REGRESSION METRICS
+# ---------------------------------------------------------------------
+
+
 def regression_metrics(
     y_true: np.ndarray,
     prediction: np.ndarray,
 ) -> RegressionMetrics:
-    """Evaluate future-return predictions."""
+    """
+    Evaluate future-return predictions.
+    """
 
     y_true = np.asarray(
         y_true,
@@ -317,6 +738,11 @@ def regression_metrics(
         dtype=float,
     ).reshape(-1)
 
+    if len(y_true) == 0:
+        raise ValueError(
+            "y_true cannot be empty."
+        )
+
     _validate_equal_length(
         y_true,
         prediction,
@@ -325,6 +751,7 @@ def regression_metrics(
     if not np.isfinite(
         y_true
     ).all():
+
         raise ValueError(
             "y_true contains non-finite values."
         )
@@ -332,6 +759,7 @@ def regression_metrics(
     if not np.isfinite(
         prediction
     ).all():
+
         raise ValueError(
             "prediction contains non-finite values."
         )
@@ -374,8 +802,15 @@ def regression_metrics(
         directional_accuracy=(
             directional_accuracy
         ),
-        samples=len(y_true),
+        samples=len(
+            y_true
+        ),
     )
+
+
+# ---------------------------------------------------------------------
+# RANGE METRICS
+# ---------------------------------------------------------------------
 
 
 def range_metrics(
@@ -387,11 +822,15 @@ def range_metrics(
     Evaluate prediction interval quality.
 
     Coverage:
-        Fraction of observations where the actual future return
-        falls inside the predicted interval.
+        Fraction of observations where actual return is inside
+        the predicted interval.
 
     Width:
         Average size of the predicted interval.
+
+    Lower/upper violation:
+        Fraction of observations outside the interval on
+        each respective side.
     """
 
     actual = np.asarray(
@@ -409,6 +848,11 @@ def range_metrics(
         dtype=float,
     ).reshape(-1)
 
+    if len(actual) == 0:
+        raise ValueError(
+            "Range inputs cannot be empty."
+        )
+
     _validate_equal_length(
         actual,
         lower,
@@ -420,6 +864,7 @@ def range_metrics(
         and np.isfinite(lower).all()
         and np.isfinite(upper).all()
     ):
+
         raise ValueError(
             "Range inputs contain non-finite values."
         )
@@ -429,6 +874,7 @@ def range_metrics(
     )
 
     if invalid_order.any():
+
         raise ValueError(
             "Predicted lower bound exceeds upper bound."
         )
@@ -462,13 +908,24 @@ def range_metrics(
             np.median(width)
         ),
         lower_violation_rate=float(
-            np.mean(lower_violation)
+            np.mean(
+                lower_violation
+            )
         ),
         upper_violation_rate=float(
-            np.mean(upper_violation)
+            np.mean(
+                upper_violation
+            )
         ),
-        samples=len(actual),
+        samples=len(
+            actual
+        ),
     )
+
+
+# ---------------------------------------------------------------------
+# CONFIDENCE / THRESHOLD ANALYSIS
+# ---------------------------------------------------------------------
 
 
 def confidence_metrics(
@@ -479,30 +936,30 @@ def confidence_metrics(
     ] = None,
 ) -> pd.DataFrame:
     """
-    Evaluate performance at different confidence thresholds.
+    Evaluate performance at different probability thresholds.
 
-    Only observations satisfying:
+    For a threshold such as 0.70:
 
-        P(up) >= threshold
+        probability >= 0.70
+            -> predicted UP
 
-    or:
+        probability <= 0.30
+            -> predicted DOWN
 
-        P(up) <= 1 - threshold
+        otherwise
+            -> WAIT
 
-    are considered actionable.
-
-    This is useful for determining whether the model can
-    responsibly say "no high-confidence setup".
+    This is much closer to the eventual swing-trading decision
+    process than simply measuring accuracy on every observation.
     """
 
     y_true = _validate_binary_target(
         y_true
     )
 
-    probability = np.asarray(
-        probability,
-        dtype=float,
-    ).reshape(-1)
+    probability = _validate_probability(
+        probability
+    )
 
     _validate_equal_length(
         y_true,
@@ -510,6 +967,7 @@ def confidence_metrics(
     )
 
     if thresholds is None:
+
         thresholds = [
             0.55,
             0.60,
@@ -548,6 +1006,7 @@ def confidence_metrics(
                     "threshold": threshold,
                     "coverage": 0.0,
                     "accuracy": np.nan,
+                    "balanced_accuracy": np.nan,
                     "samples": 0,
                 }
             )
@@ -570,6 +1029,23 @@ def confidence_metrics(
             )
         )
 
+        if len(
+            np.unique(actual)
+        ) == 2:
+
+            balanced = float(
+                balanced_accuracy_score(
+                    actual,
+                    predicted_direction,
+                )
+            )
+
+        else:
+
+            balanced = float(
+                accuracy
+            )
+
         rows.append(
             {
                 "threshold": threshold,
@@ -578,6 +1054,7 @@ def confidence_metrics(
                     / len(y_true)
                 ),
                 "accuracy": accuracy,
+                "balanced_accuracy": balanced,
                 "samples": count,
             }
         )
@@ -587,19 +1064,45 @@ def confidence_metrics(
     )
 
 
+# ---------------------------------------------------------------------
+# TRADING METRICS
+# ---------------------------------------------------------------------
+
+
 def trading_metrics(
     returns: np.ndarray,
     periods_per_year: int = 252,
     risk_free_rate: float = 0.0,
 ) -> TradingMetrics:
     """
-    Calculate basic trading performance statistics.
+    Calculate basic strategy performance statistics.
 
-    `returns` should represent strategy returns per observation.
+    Parameters
+    ----------
+    returns:
+        Strategy return for each observation.
 
-    This is intentionally a simple metric engine. A later
-    backtesting engine will handle entries, exits, stops,
-    targets, slippage and transaction costs explicitly.
+    periods_per_year:
+        Number of observations per year.
+
+    risk_free_rate:
+        Annual risk-free rate.
+
+    Notes
+    -----
+    This function is intentionally a simple metric engine.
+
+    It does NOT model:
+
+        - entries
+        - exits
+        - intraday execution
+        - stop loss
+        - target execution
+        - slippage
+        - brokerage
+
+    Those belong in the backtesting layer.
     """
 
     returns = np.asarray(
@@ -612,9 +1115,15 @@ def trading_metrics(
             "returns cannot be empty."
         )
 
+    if periods_per_year <= 0:
+        raise ValueError(
+            "periods_per_year must be positive."
+        )
+
     if not np.isfinite(
         returns
     ).all():
+
         raise ValueError(
             "returns contain non-finite values."
         )
@@ -633,26 +1142,33 @@ def trading_metrics(
         / periods_per_year
     )
 
-    if years > 0:
+    if years > 0 and equity[-1] > 0:
+
         annualized_return = (
             equity[-1]
             ** (1.0 / years)
             - 1.0
         )
-    else:
-        annualized_return = 0.0
 
-    volatility = (
-        np.std(
-            returns,
-            ddof=1,
+    else:
+
+        annualized_return = -1.0
+
+    if len(returns) > 1:
+
+        volatility = (
+            np.std(
+                returns,
+                ddof=1,
+            )
+            * np.sqrt(
+                periods_per_year
+            )
         )
-        * np.sqrt(
-            periods_per_year
-        )
-        if len(returns) > 1
-        else 0.0
-    )
+
+    else:
+
+        volatility = 0.0
 
     excess_returns = (
         returns
@@ -662,10 +1178,16 @@ def trading_metrics(
         )
     )
 
-    excess_std = np.std(
-        excess_returns,
-        ddof=1,
-    )
+    if len(excess_returns) > 1:
+
+        excess_std = np.std(
+            excess_returns,
+            ddof=1,
+        )
+
+    else:
+
+        excess_std = 0.0
 
     if excess_std > 0:
 
@@ -698,11 +1220,15 @@ def trading_metrics(
     )
 
     winning_returns = (
-        returns[returns > 0]
+        returns[
+            returns > 0
+        ]
     )
 
     losing_returns = (
-        returns[returns < 0]
+        returns[
+            returns < 0
+        ]
     )
 
     trades = int(
@@ -724,11 +1250,11 @@ def trading_metrics(
 
         win_rate = 0.0
 
-    gross_profit = (
+    gross_profit = float(
         winning_returns.sum()
     )
 
-    gross_loss = (
+    gross_loss = float(
         np.abs(
             losing_returns.sum()
         )
@@ -736,7 +1262,7 @@ def trading_metrics(
 
     if gross_loss > 0:
 
-        profit_factor = float(
+        profit_factor = (
             gross_profit
             / gross_loss
         )
@@ -767,10 +1293,19 @@ def trading_metrics(
         maximum_drawdown=(
             maximum_drawdown
         ),
-        win_rate=win_rate,
-        profit_factor=profit_factor,
+        win_rate=float(
+            win_rate
+        ),
+        profit_factor=float(
+            profit_factor
+        ),
         trades=trades,
     )
+
+
+# ---------------------------------------------------------------------
+# LEGACY ACCURACY GATE
+# ---------------------------------------------------------------------
 
 
 def evaluate_95_percent_gate(
@@ -778,20 +1313,30 @@ def evaluate_95_percent_gate(
     minimum_accuracy: float = 0.95,
 ) -> dict:
     """
-    Evaluate the project's strict directional-accuracy gate.
+    Evaluate the project's historical strict accuracy gate.
 
-    IMPORTANT:
-    Passing this function does NOT mean the model is production-ready.
+    This function is retained for backward compatibility.
 
-    The model must also pass:
+    IMPORTANT
+    ---------
+    A 95% accuracy result is NOT considered sufficient evidence
+    of a profitable trading model.
 
-        - leakage checks
-        - walk-forward testing
-        - final holdout testing
-        - calibration checks
-        - range coverage checks
-        - regime stability
-        - trading/backtest checks
+    New research should use:
+
+        - ROC-AUC
+        - PR-AUC
+        - Log Loss
+        - Brier Score
+        - MCC
+        - Calibration Error
+        - Walk-forward performance
+        - Trading expectancy
+        - Drawdown
+        - Robustness
+
+    This function should eventually be replaced by a complete
+    production approval framework.
     """
 
     passed_accuracy = (
@@ -810,10 +1355,66 @@ def evaluate_95_percent_gate(
         "samples": classification.samples,
         "production_ready": False,
         "reason": (
-            "Accuracy gate is only one research requirement. "
-            "Additional out-of-sample validation is mandatory."
+            "Accuracy alone cannot establish production readiness. "
+            "Out-of-sample validation, calibration, robustness and "
+            "trading performance are required."
         ),
     }
+
+
+# ---------------------------------------------------------------------
+# RESEARCH MODEL SCORECARD
+# ---------------------------------------------------------------------
+
+
+def research_scorecard(
+    classification: ClassificationMetrics,
+) -> dict[str, float]:
+    """
+    Return a compact research scorecard.
+
+    This is NOT a profitability score.
+
+    It is a convenient summary of statistical model quality.
+
+    Higher is generally better for:
+
+        ROC-AUC
+        PR-AUC
+        Balanced Accuracy
+        F1
+        MCC
+
+    Lower is better for:
+
+        Log Loss
+        Brier Score
+        Expected Calibration Error
+    """
+
+    return {
+        "ROC_AUC": classification.roc_auc,
+        "PR_AUC": classification.pr_auc,
+        "Balanced_Accuracy": (
+            classification.balanced_accuracy
+        ),
+        "F1": classification.f1,
+        "MCC": classification.matthews_corrcoef,
+        "Log_Loss": classification.log_loss,
+        "Brier_Score": classification.brier_score,
+        "ECE": (
+            classification.expected_calibration_error
+        ),
+        "Accuracy": classification.accuracy,
+        "Samples": float(
+            classification.samples
+        ),
+    }
+
+
+# ---------------------------------------------------------------------
+# METRIC SUMMARY
+# ---------------------------------------------------------------------
 
 
 def metric_summary(
@@ -828,7 +1429,9 @@ def metric_summary(
     ] = None,
 ) -> pd.DataFrame:
     """
-    Convert available metrics into a compact dashboard dataframe.
+    Convert available metrics into a compact dataframe.
+
+    Useful for Streamlit dashboards and experiment reports.
     """
 
     rows = []
@@ -869,8 +1472,31 @@ def metric_summary(
                 },
                 {
                     "Category": "Classification",
+                    "Metric": "PR AUC",
+                    "Value": classification.pr_auc,
+                },
+                {
+                    "Category": "Classification",
+                    "Metric": "MCC",
+                    "Value": classification.matthews_corrcoef,
+                },
+                {
+                    "Category": "Classification",
+                    "Metric": "Log Loss",
+                    "Value": classification.log_loss,
+                },
+                {
+                    "Category": "Classification",
                     "Metric": "Brier Score",
                     "Value": classification.brier_score,
+                },
+                {
+                    "Category": "Classification",
+                    "Metric": "Calibration Error",
+                    "Value": (
+                        classification
+                        .expected_calibration_error
+                    ),
                 },
             ]
         )
@@ -891,8 +1517,24 @@ def metric_summary(
                 },
                 {
                     "Category": "Regression",
+                    "Metric": "Mean Error",
+                    "Value": regression.mean_error,
+                },
+                {
+                    "Category": "Regression",
+                    "Metric": "Median Absolute Error",
+                    "Value": (
+                        regression
+                        .median_absolute_error
+                    ),
+                },
+                {
+                    "Category": "Regression",
                     "Metric": "Directional Accuracy",
-                    "Value": regression.directional_accuracy,
+                    "Value": (
+                        regression
+                        .directional_accuracy
+                    ),
                 },
             ]
         )
@@ -919,12 +1561,18 @@ def metric_summary(
                 {
                     "Category": "Range",
                     "Metric": "Lower Violation Rate",
-                    "Value": range_result.lower_violation_rate,
+                    "Value": (
+                        range_result
+                        .lower_violation_rate
+                    ),
                 },
                 {
                     "Category": "Range",
                     "Metric": "Upper Violation Rate",
-                    "Value": range_result.upper_violation_rate,
+                    "Value": (
+                        range_result
+                        .upper_violation_rate
+                    ),
                 },
             ]
         )
@@ -932,3 +1580,24 @@ def metric_summary(
     return pd.DataFrame(
         rows
     )
+
+
+__all__ = [
+    "ClassificationMetrics",
+    "RegressionMetrics",
+    "RangeMetrics",
+    "TradingMetrics",
+    "classification_metrics",
+    "classification_research_metrics",
+    "confusion_matrix_dataframe",
+    "expected_calibration_error",
+    "calibration_table",
+    "regression_metrics",
+    "range_metrics",
+    "confidence_metrics",
+    "trading_metrics",
+    "evaluate_95_percent_gate",
+    "research_scorecard",
+    "metric_summary",
+]
+```
