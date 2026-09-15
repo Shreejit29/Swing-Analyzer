@@ -1,7 +1,10 @@
 """
-Robust price-action feature engineering.
+Price-action feature engineering.
 
-Accepts normal OHLCV columns as well as common lowercase/alternative names.
+Project-wide input contract:
+    open, high, low, close, volume
+
+This module never changes the OHLCV column names.
 """
 
 from __future__ import annotations
@@ -10,183 +13,187 @@ import numpy as np
 import pandas as pd
 
 
-def _safe_div(a: pd.Series, b: pd.Series) -> pd.Series:
-    return a / b.replace(0, np.nan)
-
-
-def _normalize_ohlc_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize common OHLC column naming and simple MultiIndex layouts."""
-    out = df.copy()
-
-    # Handle yfinance-style MultiIndex columns if they reach this stage.
-    if isinstance(out.columns, pd.MultiIndex):
-        flattened = []
-        for col in out.columns:
-            parts = [str(x) for x in col if str(x).lower() != "nan"]
-            flattened.append("_".join(parts))
-        out.columns = flattened
-
-    # First try exact canonical names.
-    aliases = {
-        "open": "Open",
-        "high": "High",
-        "low": "Low",
-        "close": "Close",
-        "adj close": "Adj Close",
-        "adj_close": "Adj Close",
-        "volume": "Volume",
-    }
-
-    rename = {}
-    for col in out.columns:
-        key = str(col).strip().lower()
-        if key in aliases:
-            rename[col] = aliases[key]
-
-    out = out.rename(columns=rename)
-
-    # Handle flattened names such as Close_RELIANCE.NS or RELIANCE.NS_Close.
-    for target in ("Open", "High", "Low", "Close", "Volume"):
-        if target in out.columns:
-            continue
-
-        candidates = []
-        target_lower = target.lower()
-        for col in out.columns:
-            text = str(col).lower()
-            if text == target_lower or text.startswith(target_lower + "_") or text.endswith("_" + target_lower):
-                candidates.append(col)
-
-        if candidates:
-            out[target] = out[candidates[0]]
-
-    return out
+def _s(df: pd.DataFrame, name: str) -> pd.Series:
+    value = df[name]
+    if isinstance(value, pd.DataFrame):
+        value = value.iloc[:, 0]
+    return pd.to_numeric(value, errors="coerce")
 
 
 def add_price_action_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add candle structure, returns, support/resistance, breakouts,
-    market structure and ATR-normalized price-action features.
-    """
+    """Add candle, return, structure, support/resistance and breakout features."""
     if not isinstance(df, pd.DataFrame):
         raise TypeError("df must be a pandas DataFrame")
 
-    out = _normalize_ohlc_columns(df)
-
-    required = {"Open", "High", "Low", "Close"}
-    missing = required - set(out.columns)
+    required = ["open", "high", "low", "close"]
+    missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(
-            f"Missing required columns: {sorted(missing)}. "
-            f"Available columns: {list(out.columns)[:15]}"
+            f"Price-action features require lowercase OHLC columns. "
+            f"Missing: {missing}"
         )
 
-    o = pd.to_numeric(out["Open"], errors="coerce")
-    h = pd.to_numeric(out["High"], errors="coerce")
-    l = pd.to_numeric(out["Low"], errors="coerce")
-    c = pd.to_numeric(out["Close"], errors="coerce")
+    out = df.copy()
 
-    candle_range = (h - l).clip(lower=0)
-    body = (c - o).abs()
-    signed_body = c - o
-    prev_close = c.shift(1)
+    open_ = _s(out, "open")
+    high = _s(out, "high")
+    low = _s(out, "low")
+    close = _s(out, "close")
 
-    upper_wick = (h - pd.concat([o, c], axis=1).max(axis=1)).clip(lower=0)
-    lower_wick = (pd.concat([o, c], axis=1).min(axis=1) - l).clip(lower=0)
+    previous_close = close.shift(1)
 
-    # Candle anatomy
-    out["Candle_Range"] = candle_range
-    out["Candle_Body"] = body
-    out["Candle_Body_Signed"] = signed_body
-    out["Upper_Wick"] = upper_wick
-    out["Lower_Wick"] = lower_wick
-    out["Body_to_Range"] = _safe_div(body, candle_range)
-    out["Upper_Wick_to_Range"] = _safe_div(upper_wick, candle_range)
-    out["Lower_Wick_to_Range"] = _safe_div(lower_wick, candle_range)
+    # Candle structure
+    candle_range = (high - low).clip(lower=0)
+    body_signed = close - open_
+    body = body_signed.abs()
 
-    out["Bullish_Candle"] = (c > o).astype(int)
-    out["Bearish_Candle"] = (c < o).astype(int)
-    out["Doji_Candle"] = (out["Body_to_Range"].fillna(1) <= 0.10).astype(int)
-    out["Close_Location"] = (
-        2 * _safe_div(c - l, candle_range) - 1
-    ).clip(-1, 1)
+    upper_wick = (
+        high - pd.concat([open_, close], axis=1).max(axis=1)
+    ).clip(lower=0)
 
-    # Price movement
-    out["Gap_Pct"] = _safe_div(o - prev_close, prev_close) * 100
-    out["Intraday_Return_Pct"] = _safe_div(c - o, o) * 100
-    out["Return_1D_Pct"] = c.pct_change() * 100
-    out["Return_3D_Pct"] = c.pct_change(3) * 100
-    out["Return_5D_Pct"] = c.pct_change(5) * 100
-    out["Return_10D_Pct"] = c.pct_change(10) * 100
-    out["Return_20D_Pct"] = c.pct_change(20) * 100
-    out["Return_1D_Acceleration"] = (
-        out["Return_1D_Pct"] - out["Return_1D_Pct"].shift(1)
+    lower_wick = (
+        pd.concat([open_, close], axis=1).min(axis=1) - low
+    ).clip(lower=0)
+
+    out["candle_range"] = candle_range
+    out["candle_body"] = body
+    out["candle_body_signed"] = body_signed
+    out["upper_wick"] = upper_wick
+    out["lower_wick"] = lower_wick
+
+    out["body_to_range"] = body / candle_range.replace(0, np.nan)
+    out["upper_wick_to_range"] = (
+        upper_wick / candle_range.replace(0, np.nan)
+    )
+    out["lower_wick_to_range"] = (
+        lower_wick / candle_range.replace(0, np.nan)
     )
 
-    # Leakage-safe rolling support/resistance.
-    for window in (5, 10, 20, 50):
-        resistance = h.shift(1).rolling(window).max()
-        support = l.shift(1).rolling(window).min()
+    out["bullish_candle"] = (close > open_).astype(int)
+    out["bearish_candle"] = (close < open_).astype(int)
+    out["doji_candle"] = (
+        out["body_to_range"].fillna(1) <= 0.10
+    ).astype(int)
 
-        out[f"Resistance_{window}"] = resistance
-        out[f"Support_{window}"] = support
-        out[f"Distance_Resistance_{window}_Pct"] = (
-            _safe_div(c - resistance, resistance) * 100
+    # Where the close sits inside today's range: -1 = low, +1 = high.
+    out["close_location"] = (
+        2 * (close - low) / candle_range.replace(0, np.nan) - 1
+    ).clip(-1, 1)
+
+    # Returns and gaps
+    out["gap_pct"] = (
+        (open_ - previous_close)
+        / previous_close.replace(0, np.nan)
+        * 100
+    )
+
+    out["intraday_return_pct"] = (
+        (close - open_)
+        / open_.replace(0, np.nan)
+        * 100
+    )
+
+    for window in (1, 3, 5, 10, 20):
+        out[f"return_{window}d_pct"] = close.pct_change(window) * 100
+
+    out["return_acceleration"] = (
+        out["return_1d_pct"] - out["return_1d_pct"].shift(1)
+    )
+
+    # Leakage-safe support/resistance.
+    for window in (5, 10, 20, 50):
+        resistance = high.shift(1).rolling(
+            window, min_periods=window
+        ).max()
+
+        support = low.shift(1).rolling(
+            window, min_periods=window
+        ).min()
+
+        out[f"resistance_{window}"] = resistance
+        out[f"support_{window}"] = support
+
+        out[f"distance_resistance_{window}_pct"] = (
+            (close - resistance)
+            / resistance.replace(0, np.nan)
+            * 100
         )
-        out[f"Distance_Support_{window}_Pct"] = (
-            _safe_div(c - support, support) * 100
+
+        out[f"distance_support_{window}_pct"] = (
+            (close - support)
+            / support.replace(0, np.nan)
+            * 100
         )
-        out[f"Breakout_{window}"] = (c > resistance).astype(int)
-        out[f"Breakdown_{window}"] = (c < support).astype(int)
+
+        out[f"breakout_{window}"] = (
+            close > resistance
+        ).astype(int)
+
+        out[f"breakdown_{window}"] = (
+            close < support
+        ).astype(int)
 
     # Market structure
-    hh = (h > h.shift(1)).astype(int)
-    lh = (h < h.shift(1)).astype(int)
-    hl = (l > l.shift(1)).astype(int)
-    ll = (l < l.shift(1)).astype(int)
+    higher_high = (high > high.shift(1)).astype(int)
+    lower_high = (high < high.shift(1)).astype(int)
+    higher_low = (low > low.shift(1)).astype(int)
+    lower_low = (low < low.shift(1)).astype(int)
 
-    out["Higher_High_1D"] = hh
-    out["Lower_High_1D"] = lh
-    out["Higher_Low_1D"] = hl
-    out["Lower_Low_1D"] = ll
-    out["HH_HL_Score"] = hh + hl - lh - ll
-    out["Structure_Score_5D"] = out["HH_HL_Score"].rolling(5).sum()
-    out["Structure_Score_10D"] = out["HH_HL_Score"].rolling(10).sum()
+    out["higher_high"] = higher_high
+    out["lower_high"] = lower_high
+    out["higher_low"] = higher_low
+    out["lower_low"] = lower_low
 
-    # ATR-normalized movement
+    out["structure_score"] = (
+        higher_high
+        + higher_low
+        - lower_high
+        - lower_low
+    )
+
+    out["structure_score_5d"] = (
+        out["structure_score"].rolling(5, min_periods=5).sum()
+    )
+
+    out["structure_score_10d"] = (
+        out["structure_score"].rolling(10, min_periods=10).sum()
+    )
+
+    # Price movement relative to ATR.
     true_range = pd.concat(
         [
-            h - l,
-            (h - prev_close).abs(),
-            (l - prev_close).abs(),
+            high - low,
+            (high - previous_close).abs(),
+            (low - previous_close).abs(),
         ],
         axis=1,
     ).max(axis=1)
 
-    atr14 = true_range.rolling(14).mean()
+    atr14 = true_range.rolling(14, min_periods=14).mean()
 
-    out["True_Range"] = true_range
-    out["ATR14_PriceAction"] = atr14
-    out["Body_to_ATR"] = _safe_div(body, atr14)
-    out["Range_to_ATR"] = _safe_div(candle_range, atr14)
-    out["Close_Move_to_ATR"] = _safe_div((c - prev_close).abs(), atr14)
-
-    # Consecutive bullish/bearish candles
-    out["Bullish_Streak"] = (
-        hh * 0  # keeps index/type consistent without using price direction twice
+    out["price_action_true_range"] = true_range
+    out["price_action_atr14"] = atr14
+    out["body_to_atr"] = body / atr14.replace(0, np.nan)
+    out["range_to_atr"] = candle_range / atr14.replace(0, np.nan)
+    out["close_move_to_atr"] = (
+        (close - previous_close).abs()
+        / atr14.replace(0, np.nan)
     )
-    bullish = (c > o).astype(int)
-    bearish = (c < o).astype(int)
 
-    out["Bullish_Streak"] = bullish.groupby(
-        (bullish != bullish.shift()).cumsum()
-    ).cumsum()
-    out["Bearish_Streak"] = bearish.groupby(
-        (bearish != bearish.shift()).cumsum()
+    # Consecutive bullish/bearish candles.
+    bullish = (close > open_).astype(int)
+    bearish = (close < open_).astype(int)
+
+    out["bullish_streak"] = bullish.groupby(
+        bullish.ne(bullish.shift()).cumsum()
     ).cumsum()
 
-    # Final cleanup
-    numeric_cols = out.select_dtypes(include=[np.number]).columns
-    out[numeric_cols] = out[numeric_cols].replace([np.inf, -np.inf], np.nan)
+    out["bearish_streak"] = bearish.groupby(
+        bearish.ne(bearish.shift()).cumsum()
+    ).cumsum()
+
+    # Final cleanup.
+    numeric = out.select_dtypes(include=[np.number]).columns
+    out[numeric] = out[numeric].replace([np.inf, -np.inf], np.nan)
 
     return out
