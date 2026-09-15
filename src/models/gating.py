@@ -1,1510 +1,2083 @@
-```python
 """
-Final decision and safety gating for AI Swing Analyser.
+Backtesting engine for AI Swing Analyser.
 
-This module converts model outputs and validation diagnostics into a
-conservative research-stage decision.
+This module converts model predictions into a historical swing-trading
+strategy and evaluates both statistical and economic performance.
 
-The gate is intentionally designed to reject weak or contradictory setups.
-It does not guarantee profitability and must never override failed
-validation, leakage checks, calibration, or range-validation checks.
+Design principles
+-----------------
+1. Prediction at candle t can only enter at candle t+1.
+2. No future information is used to generate the signal.
+3. Stop-loss and take-profit are evaluated conservatively.
+4. Long and short position sizing are handled separately.
+5. Transaction costs and slippage are explicitly included.
+6. Risk-based position sizing is supported.
+7. Equity, drawdown and trade-level statistics are reported.
+8. Economic metrics are exposed for production-model approval.
 
-Economic edge is supported as an additional optional gate. It is deliberately
-optional at this stage because the prediction pipeline must first provide
-proper out-of-sample expected-return estimates.
+IMPORTANT
+---------
+This is a research backtester, not a live execution engine.
+
+Backtest results are only meaningful when the prediction series itself
+was generated using a leakage-free walk-forward process.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Dict, Iterable, Mapping, Optional, Sequence
+from dataclasses import asdict, dataclass
+from typing import Optional
 
-import math
-
-
-class Decision(str, Enum):
-    """Possible final trading decisions."""
-
-    BUY = "BUY"
-    SELL = "SELL"
-    WAIT = "WAIT"
-    NO_HIGH_CONFIDENCE_SETUP = "NO_HIGH_CONFIDENCE_SETUP"
-    REJECTED = "REJECTED"
+import numpy as np
+import pandas as pd
 
 
-class GateStatus(str, Enum):
-    """Status of an individual safety gate."""
-
-    PASS = "PASS"
-    FAIL = "FAIL"
-    WARNING = "WARNING"
-    NOT_EVALUATED = "NOT_EVALUATED"
-
-
-@dataclass(frozen=True)
-class GateResult:
-    """Result of one safety gate."""
-
-    name: str
-    status: GateStatus
-    score: float
-    reason: str
-
-    def __post_init__(self) -> None:
-        if not self.name:
-            raise ValueError("Gate name cannot be empty.")
-
-        if not math.isfinite(float(self.score)):
-            raise ValueError("Gate score must be finite.")
-
-        if not 0.0 <= float(self.score) <= 1.0:
-            raise ValueError("Gate score must be between 0 and 1.")
+# ----------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------
 
 
 @dataclass
-class DecisionConfig:
+class BacktestConfig:
     """
-    Configuration for the final decision engine.
-
-    Thresholds should eventually be selected using leakage-free
-    walk-forward validation rather than manually optimized on the
-    final test set.
-
-    Important:
-        minimum_validation_accuracy is retained for backward compatibility.
-        It is not considered sufficient evidence of profitability.
+    Configuration for the swing-trading backtest.
     """
 
-    minimum_probability: float = 0.60
-    high_confidence_probability: float = 0.70
+    initial_capital: float = 100_000.0
 
-    maximum_model_disagreement: float = 0.25
-    minimum_model_agreement: float = 0.60
+    probability_threshold: float = 0.60
 
-    minimum_timeframe_alignment: float = 0.60
+    stop_loss_pct: float = 0.03
 
-    minimum_risk_reward: float = 2.0
+    take_profit_pct: float = 0.06
 
-    minimum_range_coverage: float = 0.70
+    max_holding_period: int = 10
 
-    # Historical value was 0.95.
-    #
-    # 95% accuracy is not a sensible generic production requirement
-    # for a financial direction classifier. This is temporarily set
-    # to 60% while the research pipeline is upgraded toward:
-    #
-    #   ROC-AUC
-    #   PR-AUC
-    #   Log Loss
-    #   Brier Score
-    #   calibration
-    #   walk-forward validation
-    #   trading expectancy
-    #   drawdown
-    #   robustness
-    #
-    minimum_validation_accuracy: float = 0.60
+    @property
+    def max_holding_periods(self) -> int:
+        """Backward-compatible plural form."""
+        return self.max_holding_period
 
-    minimum_regime_stability: float = 0.60
+    transaction_cost_pct: float = 0.001
 
-    # Economic edge gate.
-    #
-    # This is NOT mandatory yet. The current predictor pipeline does
-    # not always provide expected-edge information.
-    minimum_expected_edge: float = 0.003
+    slippage_pct: float = 0.0005
 
-    require_expected_edge: bool = False
+    # Backward-compatible aliases.
+    transaction_cost: float | None = None
 
-    allow_buy: bool = True
-    allow_sell: bool = True
+    slippage: float | None = None
 
-    require_validation_pass: bool = True
-    require_calibration_pass: bool = True
-    require_range_validation_pass: bool = True
-    require_regime_validation_pass: bool = True
+    allow_long: bool = True
 
-    # A minimum number of independent positive gates required before
-    # a high-confidence setup can be considered.
-    minimum_positive_gates: int = 5
+    allow_short: bool = False
+
+    risk_per_trade: float = 0.01
+
+    max_concurrent_positions: int = 1
 
     def __post_init__(self) -> None:
-        probability_values = (
-            self.minimum_probability,
-            self.high_confidence_probability,
-            self.maximum_model_disagreement,
-            self.minimum_model_agreement,
-            self.minimum_timeframe_alignment,
-            self.minimum_range_coverage,
-            self.minimum_regime_stability,
-        )
 
-        for value in probability_values:
-            if not 0.0 <= float(value) <= 1.0:
-                raise ValueError(
-                    "Probability/ratio thresholds must be between 0 and 1."
-                )
-
-        if self.high_confidence_probability < self.minimum_probability:
-            raise ValueError(
-                "high_confidence_probability must be >= minimum_probability."
+        if self.transaction_cost is not None:
+            self.transaction_cost_pct = float(
+                self.transaction_cost
             )
 
-        if self.minimum_risk_reward <= 0:
-            raise ValueError("minimum_risk_reward must be positive.")
-
-        if self.minimum_validation_accuracy < 0.0:
-            raise ValueError(
-                "minimum_validation_accuracy cannot be negative."
+        if self.slippage is not None:
+            self.slippage_pct = float(
+                self.slippage
             )
 
-        if self.minimum_expected_edge < 0.0:
+        if self.initial_capital <= 0:
             raise ValueError(
-                "minimum_expected_edge cannot be negative."
+                "initial_capital must be positive."
             )
 
-        if self.minimum_positive_gates < 1:
-            raise ValueError("minimum_positive_gates must be at least 1.")
+        if not (
+            0.50
+            <= self.probability_threshold
+            < 1.0
+        ):
+            raise ValueError(
+                "probability_threshold must be between 0.50 and 1.0."
+            )
+
+        if self.stop_loss_pct <= 0:
+            raise ValueError(
+                "stop_loss_pct must be positive."
+            )
+
+        if self.take_profit_pct <= 0:
+            raise ValueError(
+                "take_profit_pct must be positive."
+            )
+
+        if self.max_holding_period < 1:
+            raise ValueError(
+                "max_holding_period must be >= 1."
+            )
+
+        if self.transaction_cost_pct < 0:
+            raise ValueError(
+                "transaction_cost_pct cannot be negative."
+            )
+
+        if self.slippage_pct < 0:
+            raise ValueError(
+                "slippage_pct cannot be negative."
+            )
+
+        if not (
+            0.0
+            < self.risk_per_trade
+            <= 1.0
+        ):
+            raise ValueError(
+                "risk_per_trade must be in (0, 1]."
+            )
+
+        if self.max_concurrent_positions < 1:
+            raise ValueError(
+                "max_concurrent_positions must be >= 1."
+            )
+
+
+# ----------------------------------------------------------------------
+# Trade
+# ----------------------------------------------------------------------
 
 
 @dataclass
-class DecisionInput:
+class Trade:
     """
-    Inputs required by the final decision engine.
-
-    Validation flags should come from genuinely unseen research results,
-    not from the current prediction itself.
-
-    Economic fields
-    ---------------
-    expected_edge:
-        Expected net return after estimated trading costs.
-
-        Example:
-            0.025 = +2.5%
-
-    expected_gross_return:
-        Expected return before trading costs.
-
-    expected_net_return:
-        Expected return after trading costs.
-
-    These fields are optional until the prediction pipeline is upgraded.
+    Individual completed trade.
     """
 
-    up_probability: float
-    down_probability: float
+    entry_time: pd.Timestamp
 
-    model_disagreement: float = 0.0
-    model_agreement: Optional[float] = None
-
-    timeframe_alignment: Optional[float] = None
-
-    risk_reward: Optional[float] = None
-
-    range_coverage: Optional[float] = None
-
-    validation_accuracy: Optional[float] = None
-    validation_passed: bool = False
-
-    calibration_passed: bool = False
-    range_validation_passed: bool = False
-    regime_validation_passed: bool = False
-
-    regime_stability: Optional[float] = None
-
-    validation_available: bool = False
-    calibration_available: bool = False
-    range_validation_available: bool = False
-    regime_validation_available: bool = False
-
-    market_regime: Optional[str] = None
-
-    target_return: Optional[float] = None
-    lower_return: Optional[float] = None
-    upper_return: Optional[float] = None
-
-    # --------------------------------------------------------------
-    # Economic edge
-    # --------------------------------------------------------------
-
-    expected_edge: Optional[float] = None
-    expected_gross_return: Optional[float] = None
-    expected_net_return: Optional[float] = None
-
-    current_price: Optional[float] = None
-
-    metadata: Dict[str, object] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        self._validate_probability(
-            self.up_probability,
-            "up_probability",
-        )
-
-        self._validate_probability(
-            self.down_probability,
-            "down_probability",
-        )
-
-        if not 0.0 <= float(self.model_disagreement) <= 1.0:
-            raise ValueError(
-                "model_disagreement must be between 0 and 1."
-            )
-
-        optional_ratios = {
-            "model_agreement": self.model_agreement,
-            "timeframe_alignment": self.timeframe_alignment,
-            "range_coverage": self.range_coverage,
-            "regime_stability": self.regime_stability,
-        }
-
-        for name, value in optional_ratios.items():
-            if value is not None and not 0.0 <= float(value) <= 1.0:
-                raise ValueError(
-                    f"{name} must be between 0 and 1."
-                )
-
-        if self.risk_reward is not None and self.risk_reward < 0:
-            raise ValueError(
-                "risk_reward cannot be negative."
-            )
-
-        if self.validation_accuracy is not None:
-            if self.validation_accuracy < 0:
-                raise ValueError(
-                    "validation_accuracy cannot be negative."
-                )
-
-        if self.current_price is not None:
-            if self.current_price <= 0:
-                raise ValueError(
-                    "current_price must be positive."
-                )
-
-        economic_values = {
-            "expected_edge": self.expected_edge,
-            "expected_gross_return": self.expected_gross_return,
-            "expected_net_return": self.expected_net_return,
-            "target_return": self.target_return,
-            "lower_return": self.lower_return,
-            "upper_return": self.upper_return,
-        }
-
-        for name, value in economic_values.items():
-            if value is not None and not math.isfinite(float(value)):
-                raise ValueError(
-                    f"{name} must be finite."
-                )
-
-    @staticmethod
-    def _validate_probability(
-        value: float,
-        name: str,
-    ) -> None:
-        if not 0.0 <= float(value) <= 1.0:
-            raise ValueError(
-                f"{name} must be between 0 and 1."
-            )
-
-
-@dataclass
-class DecisionResult:
-    """Final decision returned by the gating engine."""
-
-    decision: Decision
-
-    confidence: float
+    exit_time: pd.Timestamp
 
     direction: str
 
-    gates: Sequence[GateResult]
+    entry_price: float
 
-    reasons: Sequence[str]
+    exit_price: float
 
-    warnings: Sequence[str]
+    gross_return: float
 
-    positive_gate_count: int
+    transaction_cost: float
 
-    failed_gate_count: int
+    slippage_cost: float
 
-    trade_allowed: bool
+    net_return: float
 
-    high_confidence: bool
+    pnl: float
 
-    metadata: Dict[str, object] = field(default_factory=dict)
+    holding_periods: int
 
-    def passed_gates(self) -> list[GateResult]:
-        """Return all passing gates."""
-        return [
-            gate
-            for gate in self.gates
-            if gate.status == GateStatus.PASS
-        ]
+    exit_reason: str
 
-    def failed_gates(self) -> list[GateResult]:
-        """Return all failed gates."""
-        return [
-            gate
-            for gate in self.gates
-            if gate.status == GateStatus.FAIL
-        ]
+    quantity: float = 0.0
 
-    def warning_gates(self) -> list[GateResult]:
-        """Return all warning gates."""
-        return [
-            gate
-            for gate in self.gates
-            if gate.status == GateStatus.WARNING
-        ]
+    position_value: float = 0.0
+
+    risk_amount: float = 0.0
 
 
-class DecisionEngine:
+# ----------------------------------------------------------------------
+# Backtest result
+# ----------------------------------------------------------------------
+
+
+@dataclass
+class BacktestResult:
     """
-    Conservative final decision engine.
-
-    The engine is deliberately deterministic and rule-based at this stage.
-
-    Machine learning should produce:
-
-        - probabilities
-        - expected returns
-        - price ranges
-        - regime information
-
-    This module decides whether those outputs satisfy the research
-    safety constraints.
-
-    Important
-    ---------
-    This engine does not train models and does not claim that a BUY or
-    SELL decision will be profitable.
+    Complete backtest output.
     """
 
-    def __init__(
+    initial_capital: float
+
+    final_capital: float
+
+    total_return: float
+
+    annualized_return: float
+
+    volatility: float
+
+    sharpe_ratio: float
+
+    maximum_drawdown: float
+
+    win_rate: float
+
+    profit_factor: float
+
+    average_trade_return: float
+
+    median_trade_return: float
+
+    trades: int
+
+    winning_trades: int
+
+    losing_trades: int
+
+    average_holding_period: float
+
+    trades_dataframe: pd.DataFrame
+
+    equity_curve: pd.DataFrame
+
+    # Additional research metrics.
+    expectancy: float = 0.0
+
+    downside_deviation: float = 0.0
+
+    sortino_ratio: float = 0.0
+
+    calmar_ratio: float = 0.0
+
+    exposure: float = 0.0
+
+    total_transaction_cost: float = 0.0
+
+    total_slippage_cost: float = 0.0
+
+    best_trade: float = 0.0
+
+    worst_trade: float = 0.0
+
+    @property
+    def metrics(
         self,
-        config: Optional[DecisionConfig] = None,
-    ) -> None:
-        self.config = config or DecisionConfig()
-
-    def evaluate(
-        self,
-        inputs: DecisionInput,
-    ) -> DecisionResult:
-        """Evaluate all available safety gates."""
-
-        gates: list[GateResult] = []
-        reasons: list[str] = []
-        warnings: list[str] = []
-
-        direction, confidence = self._determine_direction(
-            inputs
-        )
-
-        # --------------------------------------------------------------
-        # 1. Probability gate
-        # --------------------------------------------------------------
-
-        gates.append(
-            self._probability_gate(
-                direction=direction,
-                confidence=confidence,
-            )
-        )
-
-        # --------------------------------------------------------------
-        # 2. Model agreement/disagreement
-        # --------------------------------------------------------------
-
-        gates.append(
-            self._agreement_gate(
-                inputs
-            )
-        )
-
-        # --------------------------------------------------------------
-        # 3. Multi-timeframe alignment
-        # --------------------------------------------------------------
-
-        gates.append(
-            self._timeframe_gate(
-                inputs
-            )
-        )
-
-        # --------------------------------------------------------------
-        # 4. Risk/reward
-        # --------------------------------------------------------------
-
-        gates.append(
-            self._risk_reward_gate(
-                inputs
-            )
-        )
-
-        # --------------------------------------------------------------
-        # 5. Price-range validation
-        # --------------------------------------------------------------
-
-        gates.append(
-            self._range_gate(
-                inputs
-            )
-        )
-
-        # --------------------------------------------------------------
-        # 6. Historical model validation
-        # --------------------------------------------------------------
-
-        gates.append(
-            self._validation_gate(
-                inputs
-            )
-        )
-
-        # --------------------------------------------------------------
-        # 7. Probability calibration
-        # --------------------------------------------------------------
-
-        gates.append(
-            self._calibration_gate(
-                inputs
-            )
-        )
-
-        # --------------------------------------------------------------
-        # 8. Market-regime stability
-        # --------------------------------------------------------------
-
-        gates.append(
-            self._regime_gate(
-                inputs
-            )
-        )
-
-        # --------------------------------------------------------------
-        # 9. Economic edge
-        # --------------------------------------------------------------
-
-        gates.append(
-            self._edge_gate(
-                inputs
-            )
-        )
-
-        for gate in gates:
-
-            if gate.status == GateStatus.FAIL:
-                reasons.append(
-                    gate.reason
-                )
-
-            elif gate.status == GateStatus.WARNING:
-                warnings.append(
-                    gate.reason
-                )
-
-            elif gate.status == GateStatus.PASS:
-                reasons.append(
-                    gate.reason
-                )
-
-        positive_gate_count = sum(
-            gate.status == GateStatus.PASS
-            for gate in gates
-        )
-
-        failed_gate_count = sum(
-            gate.status == GateStatus.FAIL
-            for gate in gates
-        )
-
-        # Critical safety conditions.
-        critical_failure = self._has_critical_failure(
-            gates
-        )
-
-        enough_positive_gates = (
-            positive_gate_count
-            >= self.config.minimum_positive_gates
-        )
-
-        high_confidence = (
-            confidence
-            >= self.config.high_confidence_probability
-            and enough_positive_gates
-            and failed_gate_count == 0
-        )
-
-        trade_allowed = (
-            not critical_failure
-            and enough_positive_gates
-            and failed_gate_count == 0
-        )
-
-        if critical_failure:
-
-            final_decision = Decision.REJECTED
-
-        elif not trade_allowed:
-
-            final_decision = (
-                Decision.NO_HIGH_CONFIDENCE_SETUP
-            )
-
-        elif direction == "BUY":
-
-            final_decision = Decision.BUY
-
-        elif direction == "SELL":
-
-            final_decision = Decision.SELL
-
-        else:
-
-            final_decision = Decision.WAIT
-
-        return DecisionResult(
-            decision=final_decision,
-            confidence=float(confidence),
-            direction=direction,
-            gates=gates,
-            reasons=reasons,
-            warnings=warnings,
-            positive_gate_count=positive_gate_count,
-            failed_gate_count=failed_gate_count,
-            trade_allowed=trade_allowed,
-            high_confidence=high_confidence,
-            metadata={
-                "market_regime": inputs.market_regime,
-                "up_probability": inputs.up_probability,
-                "down_probability": inputs.down_probability,
-                "expected_edge": inputs.expected_edge,
-                "expected_gross_return": (
-                    inputs.expected_gross_return
-                ),
-                "expected_net_return": (
-                    inputs.expected_net_return
-                ),
-            },
-        )
-
-    # ------------------------------------------------------------------
-    # Direction
-    # ------------------------------------------------------------------
-
-    def _determine_direction(
-        self,
-        inputs: DecisionInput,
-    ) -> tuple[str, float]:
+    ) -> dict[str, float | int]:
         """
-        Determine dominant direction.
-
-        A probability below the minimum threshold produces WAIT.
+        Compatibility view of the backtest metrics.
         """
 
-        up = float(
-            inputs.up_probability
-        )
-
-        down = float(
-            inputs.down_probability
-        )
-
-        if up >= down:
-
-            direction = "BUY"
-            confidence = up
-
-        else:
-
-            direction = "SELL"
-            confidence = down
-
-        if confidence < self.config.minimum_probability:
-
-            return "WAIT", confidence
-
-        if (
-            direction == "BUY"
-            and not self.config.allow_buy
-        ):
-
-            return "WAIT", confidence
-
-        if (
-            direction == "SELL"
-            and not self.config.allow_sell
-        ):
-
-            return "WAIT", confidence
-
-        return direction, confidence
-
-    # ------------------------------------------------------------------
-    # Individual gates
-    # ------------------------------------------------------------------
-
-    def _probability_gate(
-        self,
-        direction: str,
-        confidence: float,
-    ) -> GateResult:
-
-        if direction == "WAIT":
-
-            return GateResult(
-                name="direction_probability",
-                status=GateStatus.FAIL,
-                score=confidence,
-                reason=(
-                    f"Directional probability "
-                    f"{confidence:.1%} is below "
-                    f"the minimum threshold of "
-                    f"{self.config.minimum_probability:.1%}."
-                ),
-            )
-
-        if (
-            confidence
-            >= self.config.high_confidence_probability
-        ):
-
-            status = GateStatus.PASS
-
-        else:
-
-            status = GateStatus.WARNING
-
-        return GateResult(
-            name="direction_probability",
-            status=status,
-            score=confidence,
-            reason=(
-                f"{direction} probability is "
-                f"{confidence:.1%}."
+        return {
+            "final_capital": self.final_capital,
+            "total_return": self.total_return,
+            "annualized_return": self.annualized_return,
+            "volatility": self.volatility,
+            "sharpe_ratio": self.sharpe_ratio,
+            "maximum_drawdown": self.maximum_drawdown,
+            "max_drawdown": self.maximum_drawdown,
+            "win_rate": self.win_rate,
+            "profit_factor": self.profit_factor,
+            "average_trade_return": (
+                self.average_trade_return
             ),
-        )
-
-    def _agreement_gate(
-        self,
-        inputs: DecisionInput,
-    ) -> GateResult:
-
-        disagreement = float(
-            inputs.model_disagreement
-        )
-
-        if inputs.model_agreement is not None:
-
-            agreement = float(
-                inputs.model_agreement
-            )
-
-        else:
-
-            agreement = 1.0 - disagreement
-
-        if (
-            disagreement
-            > self.config.maximum_model_disagreement
-        ):
-
-            return GateResult(
-                name="model_agreement",
-                status=GateStatus.FAIL,
-                score=agreement,
-                reason=(
-                    f"Model disagreement is "
-                    f"{disagreement:.1%}, exceeding "
-                    f"the maximum allowed "
-                    f"{self.config.maximum_model_disagreement:.1%}."
-                ),
-            )
-
-        if (
-            agreement
-            < self.config.minimum_model_agreement
-        ):
-
-            return GateResult(
-                name="model_agreement",
-                status=GateStatus.FAIL,
-                score=agreement,
-                reason=(
-                    f"Model agreement is "
-                    f"{agreement:.1%}, below the "
-                    f"required "
-                    f"{self.config.minimum_model_agreement:.1%}."
-                ),
-            )
-
-        return GateResult(
-            name="model_agreement",
-            status=GateStatus.PASS,
-            score=agreement,
-            reason=(
-                f"Models agree at approximately "
-                f"{agreement:.1%}."
+            "median_trade_return": (
+                self.median_trade_return
             ),
-        )
-
-    def _timeframe_gate(
-        self,
-        inputs: DecisionInput,
-    ) -> GateResult:
-
-        if inputs.timeframe_alignment is None:
-
-            return GateResult(
-                name="multi_timeframe_alignment",
-                status=GateStatus.NOT_EVALUATED,
-                score=0.0,
-                reason=(
-                    "Multi-timeframe alignment was "
-                    "not available. No additional "
-                    "confirmation was granted."
-                ),
-            )
-
-        alignment = float(
-            inputs.timeframe_alignment
-        )
-
-        if (
-            alignment
-            < self.config.minimum_timeframe_alignment
-        ):
-
-            return GateResult(
-                name="multi_timeframe_alignment",
-                status=GateStatus.FAIL,
-                score=alignment,
-                reason=(
-                    f"Multi-timeframe alignment is "
-                    f"{alignment:.1%}, below the "
-                    f"required "
-                    f"{self.config.minimum_timeframe_alignment:.1%}."
-                ),
-            )
-
-        return GateResult(
-            name="multi_timeframe_alignment",
-            status=GateStatus.PASS,
-            score=alignment,
-            reason=(
-                f"Multi-timeframe alignment is "
-                f"{alignment:.1%}."
+            "trades": self.trades,
+            "trade_count": self.trades,
+            "expectancy": self.expectancy,
+            "downside_deviation": (
+                self.downside_deviation
             ),
-        )
-
-    def _risk_reward_gate(
-        self,
-        inputs: DecisionInput,
-    ) -> GateResult:
-
-        if inputs.risk_reward is None:
-
-            return GateResult(
-                name="risk_reward",
-                status=GateStatus.NOT_EVALUATED,
-                score=0.0,
-                reason=(
-                    "Risk/reward has not been "
-                    "calculated. A trade should "
-                    "not receive high-confidence "
-                    "status."
-                ),
-            )
-
-        rr = float(
-            inputs.risk_reward
-        )
-
-        if (
-            rr
-            < self.config.minimum_risk_reward
-        ):
-
-            return GateResult(
-                name="risk_reward",
-                status=GateStatus.FAIL,
-                score=self._ratio_score(
-                    rr,
-                    self.config.minimum_risk_reward,
-                ),
-                reason=(
-                    f"Risk/reward of {rr:.2f} "
-                    f"is below the required "
-                    f"{self.config.minimum_risk_reward:.2f}."
-                ),
-            )
-
-        return GateResult(
-            name="risk_reward",
-            status=GateStatus.PASS,
-            score=1.0,
-            reason=(
-                f"Risk/reward is {rr:.2f}."
+            "sortino_ratio": self.sortino_ratio,
+            "calmar_ratio": self.calmar_ratio,
+            "exposure": self.exposure,
+            "total_transaction_cost": (
+                self.total_transaction_cost
             ),
-        )
-
-    def _range_gate(
-        self,
-        inputs: DecisionInput,
-    ) -> GateResult:
-
-        if not inputs.range_validation_available:
-
-            return GateResult(
-                name="range_validation",
-                status=GateStatus.NOT_EVALUATED,
-                score=0.0,
-                reason=(
-                    "Price-range validation is not "
-                    "available. Range reliability "
-                    "has not been established."
-                ),
-            )
-
-        if not inputs.range_validation_passed:
-
-            return GateResult(
-                name="range_validation",
-                status=GateStatus.FAIL,
-                score=0.0,
-                reason=(
-                    "Predicted price-range "
-                    "validation failed."
-                ),
-            )
-
-        if inputs.range_coverage is not None:
-
-            coverage = float(
-                inputs.range_coverage
-            )
-
-            if (
-                coverage
-                < self.config.minimum_range_coverage
-            ):
-
-                return GateResult(
-                    name="range_validation",
-                    status=GateStatus.FAIL,
-                    score=coverage,
-                    reason=(
-                        f"Observed range coverage "
-                        f"of {coverage:.1%} is below "
-                        f"the minimum "
-                        f"{self.config.minimum_range_coverage:.1%}."
-                    ),
-                )
-
-            return GateResult(
-                name="range_validation",
-                status=GateStatus.PASS,
-                score=coverage,
-                reason=(
-                    f"Predicted range validation "
-                    f"passed with "
-                    f"{coverage:.1%} coverage."
-                ),
-            )
-
-        return GateResult(
-            name="range_validation",
-            status=GateStatus.PASS,
-            score=1.0,
-            reason=(
-                "Predicted price-range "
-                "validation passed."
+            "total_slippage_cost": (
+                self.total_slippage_cost
             ),
-        )
-
-    def _validation_gate(
-        self,
-        inputs: DecisionInput,
-    ) -> GateResult:
-
-        if not inputs.validation_available:
-
-            if self.config.require_validation_pass:
-
-                return GateResult(
-                    name="historical_validation",
-                    status=GateStatus.FAIL,
-                    score=0.0,
-                    reason=(
-                        "No qualifying historical "
-                        "out-of-sample validation "
-                        "result is available."
-                    ),
-                )
-
-            return GateResult(
-                name="historical_validation",
-                status=GateStatus.WARNING,
-                score=0.0,
-                reason=(
-                    "Historical validation was "
-                    "not available."
-                ),
-            )
-
-        if not inputs.validation_passed:
-
-            return GateResult(
-                name="historical_validation",
-                status=GateStatus.FAIL,
-                score=0.0,
-                reason=(
-                    "Historical validation gate failed."
-                ),
-            )
-
-        if inputs.validation_accuracy is not None:
-
-            accuracy = float(
-                inputs.validation_accuracy
-            )
-
-            if (
-                accuracy
-                < self.config.minimum_validation_accuracy
-            ):
-
-                return GateResult(
-                    name="historical_validation",
-                    status=GateStatus.FAIL,
-                    score=min(
-                        max(
-                            accuracy,
-                            0.0,
-                        ),
-                        1.0,
-                    ),
-                    reason=(
-                        f"Validation accuracy "
-                        f"{accuracy:.1%} is below "
-                        f"the research threshold "
-                        f"{self.config.minimum_validation_accuracy:.1%}."
-                    ),
-                )
-
-            return GateResult(
-                name="historical_validation",
-                status=GateStatus.PASS,
-                score=min(
-                    max(
-                        accuracy,
-                        0.0,
-                    ),
-                    1.0,
-                ),
-                reason=(
-                    f"Historical validation "
-                    f"passed with "
-                    f"{accuracy:.1%} accuracy. "
-                    f"Accuracy alone is not "
-                    f"evidence of profitability."
-                ),
-            )
-
-        return GateResult(
-            name="historical_validation",
-            status=GateStatus.PASS,
-            score=1.0,
-            reason=(
-                "Historical validation gate passed."
-            ),
-        )
-
-    def _calibration_gate(
-        self,
-        inputs: DecisionInput,
-    ) -> GateResult:
-
-        if not inputs.calibration_available:
-
-            if self.config.require_calibration_pass:
-
-                return GateResult(
-                    name="probability_calibration",
-                    status=GateStatus.FAIL,
-                    score=0.0,
-                    reason=(
-                        "Probability calibration "
-                        "has not been independently "
-                        "validated."
-                    ),
-                )
-
-            return GateResult(
-                name="probability_calibration",
-                status=GateStatus.WARNING,
-                score=0.0,
-                reason=(
-                    "Probability calibration "
-                    "was not available."
-                ),
-            )
-
-        if not inputs.calibration_passed:
-
-            return GateResult(
-                name="probability_calibration",
-                status=GateStatus.FAIL,
-                score=0.0,
-                reason=(
-                    "Probability calibration failed."
-                ),
-            )
-
-        return GateResult(
-            name="probability_calibration",
-            status=GateStatus.PASS,
-            score=1.0,
-            reason=(
-                "Probability calibration passed."
-            ),
-        )
-
-    def _regime_gate(
-        self,
-        inputs: DecisionInput,
-    ) -> GateResult:
-
-        if not inputs.regime_validation_available:
-
-            if self.config.require_regime_validation_pass:
-
-                return GateResult(
-                    name="regime_stability",
-                    status=GateStatus.FAIL,
-                    score=0.0,
-                    reason=(
-                        "Regime-specific validation "
-                        "is not available."
-                    ),
-                )
-
-            return GateResult(
-                name="regime_stability",
-                status=GateStatus.WARNING,
-                score=0.0,
-                reason=(
-                    "Regime validation was "
-                    "not available."
-                ),
-            )
-
-        if not inputs.regime_validation_passed:
-
-            return GateResult(
-                name="regime_stability",
-                status=GateStatus.FAIL,
-                score=0.0,
-                reason=(
-                    "Regime stability validation failed."
-                ),
-            )
-
-        stability = (
-            float(inputs.regime_stability)
-            if inputs.regime_stability is not None
-            else 1.0
-        )
-
-        if (
-            stability
-            < self.config.minimum_regime_stability
-        ):
-
-            return GateResult(
-                name="regime_stability",
-                status=GateStatus.FAIL,
-                score=stability,
-                reason=(
-                    f"Regime stability score "
-                    f"{stability:.1%} is below "
-                    f"the required "
-                    f"{self.config.minimum_regime_stability:.1%}."
-                ),
-            )
-
-        return GateResult(
-            name="regime_stability",
-            status=GateStatus.PASS,
-            score=stability,
-            reason=(
-                f"Regime stability score "
-                f"is {stability:.1%}."
-            ),
-        )
-
-    # ------------------------------------------------------------------
-    # Economic edge
-    # ------------------------------------------------------------------
-
-    def _edge_gate(
-        self,
-        inputs: DecisionInput,
-    ) -> GateResult:
-        """
-        Evaluate expected economic edge.
-
-        Expected edge is expressed as a decimal return.
-
-        Examples:
-
-            0.010 = +1.0%
-            0.025 = +2.5%
-            -0.005 = -0.5%
-
-        The edge gate is optional until the prediction layer supplies
-        a reliable out-of-sample expected return estimate.
-        """
-
-        if inputs.expected_edge is None:
-
-            if self.config.require_expected_edge:
-
-                return GateResult(
-                    name="expected_edge",
-                    status=GateStatus.FAIL,
-                    score=0.0,
-                    reason=(
-                        "Expected economic edge is "
-                        "required but was not provided."
-                    ),
-                )
-
-            return GateResult(
-                name="expected_edge",
-                status=GateStatus.NOT_EVALUATED,
-                score=0.0,
-                reason=(
-                    "Expected economic edge is not "
-                    "available. The economic gate "
-                    "was therefore not used."
-                ),
-            )
-
-        edge = float(
-            inputs.expected_edge
-        )
-
-        if not math.isfinite(edge):
-
-            return GateResult(
-                name="expected_edge",
-                status=GateStatus.FAIL,
-                score=0.0,
-                reason=(
-                    "Expected economic edge "
-                    "is not finite."
-                ),
-            )
-
-        minimum_edge = float(
-            self.config.minimum_expected_edge
-        )
-
-        if minimum_edge <= 0:
-
-            score = (
-                1.0
-                if edge >= 0
-                else 0.0
-            )
-
-        else:
-
-            score = max(
-                0.0,
-                min(
-                    1.0,
-                    edge / minimum_edge,
-                ),
-            )
-
-        if edge < minimum_edge:
-
-            return GateResult(
-                name="expected_edge",
-                status=GateStatus.FAIL,
-                score=score,
-                reason=(
-                    f"Expected net edge is "
-                    f"{edge:.2%}, below the "
-                    f"minimum required "
-                    f"{minimum_edge:.2%}."
-                ),
-            )
-
-        return GateResult(
-            name="expected_edge",
-            status=GateStatus.PASS,
-            score=score,
-            reason=(
-                f"Expected net edge is "
-                f"{edge:.2%}, above the "
-                f"minimum required "
-                f"{minimum_edge:.2%}."
-            ),
-        )
-
-    # ------------------------------------------------------------------
-    # Critical safety logic
-    # ------------------------------------------------------------------
-
-    def _has_critical_failure(
-        self,
-        gates: Iterable[GateResult],
-    ) -> bool:
-
-        critical_gate_names = {
-            "historical_validation",
-            "probability_calibration",
-            "range_validation",
-            "regime_stability",
+            "best_trade": self.best_trade,
+            "worst_trade": self.worst_trade,
         }
 
-        # Economic edge is critical only when explicitly required.
-        if self.config.require_expected_edge:
 
-            critical_gate_names.add(
-                "expected_edge"
-            )
-
-        return any(
-            gate.name in critical_gate_names
-            and gate.status == GateStatus.FAIL
-            for gate in gates
-        )
-
-    @staticmethod
-    def _ratio_score(
-        actual: float,
-        required: float,
-    ) -> float:
-
-        if required <= 0:
-            return 1.0
-
-        return max(
-            0.0,
-            min(
-                1.0,
-                actual / required,
-            ),
-        )
+# ----------------------------------------------------------------------
+# Validation
+# ----------------------------------------------------------------------
 
 
-def calculate_confidence(
-    up_probability: float,
-    down_probability: float,
-    model_disagreement: float = 0.0,
-    timeframe_alignment: Optional[float] = None,
-) -> float:
+def _validate_price_data(
+    data: pd.DataFrame,
+) -> None:
     """
-    Calculate a diagnostic confidence score.
-
-    This is NOT a calibrated probability.
-
-    The function combines directional strength with agreement and,
-    when available, multi-timeframe confirmation.
+    Validate OHLC price data.
     """
 
-    if not 0.0 <= up_probability <= 1.0:
-
-        raise ValueError(
-            "up_probability must be between 0 and 1."
+    if not isinstance(
+        data,
+        pd.DataFrame,
+    ):
+        raise TypeError(
+            "Price data must be a pandas DataFrame."
         )
 
-    if not 0.0 <= down_probability <= 1.0:
-
-        raise ValueError(
-            "down_probability must be between 0 and 1."
-        )
-
-    if not 0.0 <= model_disagreement <= 1.0:
-
-        raise ValueError(
-            "model_disagreement must be between 0 and 1."
-        )
-
-    directional_strength = max(
-        up_probability,
-        down_probability,
-    )
-
-    agreement_strength = (
-        1.0
-        - model_disagreement
-    )
-
-    components = [
-        directional_strength,
-        agreement_strength,
+    required = [
+        "Open",
+        "High",
+        "Low",
+        "Close",
     ]
 
-    if timeframe_alignment is not None:
+    missing = [
+        column
+        for column in required
+        if column not in data.columns
+    ]
 
-        if not 0.0 <= timeframe_alignment <= 1.0:
-
-            raise ValueError(
-                "timeframe_alignment must be between 0 and 1."
-            )
-
-        components.append(
-            timeframe_alignment
+    if missing:
+        raise ValueError(
+            f"Missing price columns: {missing}"
         )
 
+    if not isinstance(
+        data.index,
+        pd.DatetimeIndex,
+    ):
+        raise TypeError(
+            "Price data must use a DatetimeIndex."
+        )
+
+    if len(data) < 2:
+        raise ValueError(
+            "At least two price rows are required."
+        )
+
+    if data.index.has_duplicates:
+        raise ValueError(
+            "Price data contains duplicate timestamps."
+        )
+
+    if not data.index.is_monotonic_increasing:
+        raise ValueError(
+            "Price data must be chronologically sorted."
+        )
+
+    prices = data[
+        required
+    ].apply(
+        pd.to_numeric,
+        errors="coerce",
+    )
+
+    if prices.isna().any().any():
+        raise ValueError(
+            "Price data contains missing OHLC values."
+        )
+
+    if not np.isfinite(
+        prices.to_numpy(
+            dtype=float
+        )
+    ).all():
+        raise ValueError(
+            "Price data contains NaN or infinite values."
+        )
+
+    if (
+        prices[
+            "High"
+        ]
+        < prices[
+            "Low"
+        ]
+    ).any():
+        raise ValueError(
+            "High price is below Low price."
+        )
+
+    if (
+        prices[
+            "Open"
+        ]
+        <= 0
+    ).any():
+        raise ValueError(
+            "Open prices must be positive."
+        )
+
+    if (
+        prices[
+            "High"
+        ]
+        <= 0
+    ).any():
+        raise ValueError(
+            "High prices must be positive."
+        )
+
+    if (
+        prices[
+            "Low"
+        ]
+        <= 0
+    ).any():
+        raise ValueError(
+            "Low prices must be positive."
+        )
+
+    if (
+        prices[
+            "Close"
+        ]
+        <= 0
+    ).any():
+        raise ValueError(
+            "Close prices must be positive."
+        )
+
+
+def _validate_predictions(
+    data: pd.DataFrame,
+    probability: pd.Series,
+) -> None:
+    """
+    Validate prediction probabilities.
+    """
+
+    if not isinstance(
+        probability,
+        pd.Series,
+    ):
+        probability = pd.Series(
+            probability
+        )
+
+    if not isinstance(
+        probability.index,
+        pd.DatetimeIndex,
+    ):
+        raise TypeError(
+            "Prediction index must be DatetimeIndex."
+        )
+
+    if not probability.index.is_monotonic_increasing:
+        raise ValueError(
+            "Prediction timestamps must be sorted."
+        )
+
+    if not probability.index.is_unique:
+        raise ValueError(
+            "Prediction timestamps must be unique."
+        )
+
+    aligned = probability.reindex(
+        data.index
+    )
+
+    if aligned.isna().all():
+        raise ValueError(
+            "No predictions overlap price data."
+        )
+
+    numeric = pd.to_numeric(
+        aligned,
+        errors="coerce",
+    )
+
+    if (
+        numeric.dropna()
+        .lt(0.0)
+        .any()
+    ):
+        raise ValueError(
+            "Prediction probabilities must be >= 0."
+        )
+
+    if (
+        numeric.dropna()
+        .gt(1.0)
+        .any()
+    ):
+        raise ValueError(
+            "Prediction probabilities must be <= 1."
+        )
+
+
+# ----------------------------------------------------------------------
+# Return calculations
+# ----------------------------------------------------------------------
+
+
+def _calculate_long_return(
+    entry_price: float,
+    exit_price: float,
+) -> float:
+    """
+    Calculate gross long return.
+    """
+
+    if entry_price <= 0:
+        raise ValueError(
+            "entry_price must be positive."
+        )
+
+    return (
+        exit_price
+        / entry_price
+        - 1.0
+    )
+
+
+def _calculate_short_return(
+    entry_price: float,
+    exit_price: float,
+) -> float:
+    """
+    Calculate gross short return.
+
+    Example:
+
+        Entry = 100
+        Exit  = 95
+
+        Gross return = 5.26%
+    """
+
+    if entry_price <= 0:
+        raise ValueError(
+            "entry_price must be positive."
+        )
+
+    if exit_price <= 0:
+        raise ValueError(
+            "exit_price must be positive."
+        )
+
+    return (
+        entry_price
+        / exit_price
+        - 1.0
+    )
+
+
+def _apply_costs(
+    gross_return: float,
+    transaction_cost_pct: float,
+    slippage_pct: float,
+) -> tuple[
+    float,
+    float,
+    float,
+]:
+    """
+    Apply round-trip transaction costs and slippage.
+
+    The percentages are treated as fractions of traded notional.
+
+    Example:
+
+        transaction_cost_pct = 0.001
+        slippage_pct = 0.0005
+
+    Total round-trip cost:
+
+        2 * 0.001 + 2 * 0.0005
+        = 0.003
+        = 0.30%
+    """
+
+    transaction_cost = (
+        2.0
+        * transaction_cost_pct
+    )
+
+    slippage_cost = (
+        2.0
+        * slippage_pct
+    )
+
+    net_return = (
+        gross_return
+        - transaction_cost
+        - slippage_cost
+    )
+
+    return (
+        float(net_return),
+        float(transaction_cost),
+        float(slippage_cost),
+    )
+
+
+# ----------------------------------------------------------------------
+# Position sizing
+# ----------------------------------------------------------------------
+
+
+def _position_size(
+    capital: float,
+    entry_price: float,
+    stop_price: float,
+    risk_fraction: float,
+) -> float:
+    """
+    Calculate quantity using fixed fractional risk.
+
+    This helper preserves the original long-position behavior.
+
+    For a long:
+
+        risk/share = entry - stop
+
+    Position size is also capped by available capital.
+    """
+
+    if capital <= 0:
+        return 0.0
+
+    if entry_price <= 0:
+        return 0.0
+
+    if stop_price >= entry_price:
+        return 0.0
+
+    if not (
+        0.0
+        < risk_fraction
+        <= 1.0
+    ):
+        return 0.0
+
+    risk_per_share = (
+        entry_price
+        - stop_price
+    )
+
+    if risk_per_share <= 0:
+        return 0.0
+
+    risk_amount = (
+        capital
+        * risk_fraction
+    )
+
+    quantity = (
+        risk_amount
+        / risk_per_share
+    )
+
+    max_quantity = (
+        capital
+        / entry_price
+    )
+
     return float(
-        sum(components)
-        / len(components)
+        min(
+            quantity,
+            max_quantity,
+        )
     )
 
 
-def build_decision_input(
+def _position_size_directional(
     *,
-    up_probability: float,
-    down_probability: float,
-    model_disagreement: float = 0.0,
-    timeframe_alignment: Optional[float] = None,
-    risk_reward: Optional[float] = None,
-    range_coverage: Optional[float] = None,
-    validation_accuracy: Optional[float] = None,
-    validation_passed: bool = False,
-    calibration_passed: bool = False,
-    range_validation_passed: bool = False,
-    regime_validation_passed: bool = False,
-    regime_stability: Optional[float] = None,
-    validation_available: bool = False,
-    calibration_available: bool = False,
-    range_validation_available: bool = False,
-    regime_validation_available: bool = False,
-    market_regime: Optional[str] = None,
-    target_return: Optional[float] = None,
-    lower_return: Optional[float] = None,
-    upper_return: Optional[float] = None,
-    expected_edge: Optional[float] = None,
-    expected_gross_return: Optional[float] = None,
-    expected_net_return: Optional[float] = None,
-    current_price: Optional[float] = None,
-    metadata: Optional[
-        Mapping[str, object]
-    ] = None,
-) -> DecisionInput:
+    capital: float,
+    entry_price: float,
+    stop_price: float,
+    risk_fraction: float,
+    direction: str,
+) -> float:
     """
-    Convenience constructor for DecisionInput.
+    Direction-aware position sizing.
+
+    Long:
+
+        risk/share = stop - entry in absolute terms.
+
+    Short:
+
+        risk/share = stop - entry in absolute terms.
+
+    Both are converted to an absolute risk per share.
+
+    Position value is capped at available capital.
     """
 
-    return DecisionInput(
-        up_probability=up_probability,
-        down_probability=down_probability,
-        model_disagreement=model_disagreement,
-        timeframe_alignment=timeframe_alignment,
-        risk_reward=risk_reward,
-        range_coverage=range_coverage,
-        validation_accuracy=validation_accuracy,
-        validation_passed=validation_passed,
-        calibration_passed=calibration_passed,
-        range_validation_passed=range_validation_passed,
-        regime_validation_passed=regime_validation_passed,
-        regime_stability=regime_stability,
-        validation_available=validation_available,
-        calibration_available=calibration_available,
-        range_validation_available=range_validation_available,
-        regime_validation_available=regime_validation_available,
-        market_regime=market_regime,
-        target_return=target_return,
-        lower_return=lower_return,
-        upper_return=upper_return,
-        expected_edge=expected_edge,
-        expected_gross_return=expected_gross_return,
-        expected_net_return=expected_net_return,
-        current_price=current_price,
-        metadata=dict(
-            metadata or {}
+    if capital <= 0:
+        return 0.0
+
+    if entry_price <= 0:
+        return 0.0
+
+    if stop_price <= 0:
+        return 0.0
+
+    if not (
+        0.0
+        < risk_fraction
+        <= 1.0
+    ):
+        return 0.0
+
+    direction = str(
+        direction
+    ).upper()
+
+    if direction == "LONG":
+
+        if stop_price >= entry_price:
+            return 0.0
+
+    elif direction == "SHORT":
+
+        if stop_price <= entry_price:
+            return 0.0
+
+    else:
+        raise ValueError(
+            f"Unknown direction: {direction}"
+        )
+
+    risk_per_share = abs(
+        entry_price
+        - stop_price
+    )
+
+    if risk_per_share <= 0:
+        return 0.0
+
+    risk_amount = (
+        capital
+        * risk_fraction
+    )
+
+    quantity = (
+        risk_amount
+        / risk_per_share
+    )
+
+    max_quantity = (
+        capital
+        / entry_price
+    )
+
+    return float(
+        min(
+            quantity,
+            max_quantity,
+        )
+    )
+
+
+# ----------------------------------------------------------------------
+# Trade construction
+# ----------------------------------------------------------------------
+
+
+def _exit_trade(
+    direction: str,
+    entry_price: float,
+    exit_price: float,
+    entry_time: pd.Timestamp,
+    exit_time: pd.Timestamp,
+    holding_periods: int,
+    exit_reason: str,
+    capital: float,
+    config: BacktestConfig,
+) -> Trade:
+    """
+    Create a completed trade.
+
+    Position sizing is direction-aware.
+    """
+
+    direction = str(
+        direction
+    ).upper()
+
+    if direction == "LONG":
+
+        gross_return = (
+            _calculate_long_return(
+                entry_price,
+                exit_price,
+            )
+        )
+
+        stop_price = (
+            entry_price
+            * (
+                1.0
+                - config.stop_loss_pct
+            )
+        )
+
+    elif direction == "SHORT":
+
+        gross_return = (
+            _calculate_short_return(
+                entry_price,
+                exit_price,
+            )
+        )
+
+        stop_price = (
+            entry_price
+            * (
+                1.0
+                + config.stop_loss_pct
+            )
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown direction: {direction}"
+        )
+
+    (
+        net_return,
+        transaction_cost,
+        slippage_cost,
+    ) = _apply_costs(
+        gross_return=gross_return,
+        transaction_cost_pct=(
+            config.transaction_cost_pct
+        ),
+        slippage_pct=(
+            config.slippage_pct
+        ),
+    )
+
+    quantity = (
+        _position_size_directional(
+            capital=capital,
+            entry_price=entry_price,
+            stop_price=stop_price,
+            risk_fraction=(
+                config.risk_per_trade
+            ),
+            direction=direction,
+        )
+    )
+
+    position_value = (
+        quantity
+        * entry_price
+    )
+
+    risk_amount = (
+        capital
+        * config.risk_per_trade
+    )
+
+    pnl = (
+        position_value
+        * net_return
+    )
+
+    return Trade(
+        entry_time=entry_time,
+        exit_time=exit_time,
+        direction=direction,
+        entry_price=float(
+            entry_price
+        ),
+        exit_price=float(
+            exit_price
+        ),
+        gross_return=float(
+            gross_return
+        ),
+        transaction_cost=float(
+            transaction_cost
+        ),
+        slippage_cost=float(
+            slippage_cost
+        ),
+        net_return=float(
+            net_return
+        ),
+        pnl=float(
+            pnl
+        ),
+        holding_periods=int(
+            holding_periods
+        ),
+        exit_reason=str(
+            exit_reason
+        ),
+        quantity=float(
+            quantity
+        ),
+        position_value=float(
+            position_value
+        ),
+        risk_amount=float(
+            risk_amount
         ),
     )
 
 
-def decision_to_dict(
-    result: DecisionResult,
-) -> Dict[str, object]:
+# ----------------------------------------------------------------------
+# Long trade simulation
+# ----------------------------------------------------------------------
+
+
+def _simulate_long_trade(
+    data: pd.DataFrame,
+    entry_position: int,
+    config: BacktestConfig,
+    capital: float,
+) -> Trade:
     """
-    Convert a DecisionResult into a serializable dictionary.
+    Simulate one long trade.
+
+    If stop and target are both touched in the same candle,
+    stop-loss is assumed to occur first.
     """
 
-    return {
-        "decision": result.decision.value,
-        "confidence": result.confidence,
-        "direction": result.direction,
-        "positive_gate_count": result.positive_gate_count,
-        "failed_gate_count": result.failed_gate_count,
-        "trade_allowed": result.trade_allowed,
-        "high_confidence": result.high_confidence,
-        "reasons": list(
-            result.reasons
+    entry_row = data.iloc[
+        entry_position
+    ]
+
+    entry_time = data.index[
+        entry_position
+    ]
+
+    entry_price = float(
+        entry_row["Open"]
+    )
+
+    stop_price = (
+        entry_price
+        * (
+            1.0
+            - config.stop_loss_pct
+        )
+    )
+
+    target_price = (
+        entry_price
+        * (
+            1.0
+            + config.take_profit_pct
+        )
+    )
+
+    last_position = min(
+        entry_position
+        + config.max_holding_periods,
+        len(data) - 1,
+    )
+
+    for position in range(
+        entry_position + 1,
+        last_position + 1,
+    ):
+
+        row = data.iloc[
+            position
+        ]
+
+        high = float(
+            row["High"]
+        )
+
+        low = float(
+            row["Low"]
+        )
+
+        timestamp = data.index[
+            position
+        ]
+
+        # Conservative intrabar ordering.
+        if low <= stop_price:
+
+            return _exit_trade(
+                direction="LONG",
+                entry_price=entry_price,
+                exit_price=stop_price,
+                entry_time=entry_time,
+                exit_time=timestamp,
+                holding_periods=(
+                    position
+                    - entry_position
+                ),
+                exit_reason="STOP_LOSS",
+                capital=capital,
+                config=config,
+            )
+
+        if high >= target_price:
+
+            return _exit_trade(
+                direction="LONG",
+                entry_price=entry_price,
+                exit_price=target_price,
+                entry_time=entry_time,
+                exit_time=timestamp,
+                holding_periods=(
+                    position
+                    - entry_position
+                ),
+                exit_reason="TAKE_PROFIT",
+                capital=capital,
+                config=config,
+            )
+
+    exit_position = last_position
+
+    exit_row = data.iloc[
+        exit_position
+    ]
+
+    return _exit_trade(
+        direction="LONG",
+        entry_price=entry_price,
+        exit_price=float(
+            exit_row["Close"]
         ),
-        "warnings": list(
-            result.warnings
-        ),
-        "gates": [
-            {
-                "name": gate.name,
-                "status": gate.status.value,
-                "score": gate.score,
-                "reason": gate.reason,
-            }
-            for gate in result.gates
+        entry_time=entry_time,
+        exit_time=data.index[
+            exit_position
         ],
-        "metadata": dict(
-            result.metadata
+        holding_periods=(
+            exit_position
+            - entry_position
         ),
-    }
+        exit_reason="TIME_EXIT",
+        capital=capital,
+        config=config,
+    )
 
 
-def gate_summary(
-    result: DecisionResult,
-) -> Dict[str, object]:
+# ----------------------------------------------------------------------
+# Short trade simulation
+# ----------------------------------------------------------------------
+
+
+def _simulate_short_trade(
+    data: pd.DataFrame,
+    entry_position: int,
+    config: BacktestConfig,
+    capital: float,
+) -> Trade:
     """
-    Return a compact summary suitable for a dashboard.
+    Simulate one short trade.
+
+    If stop and target are both touched in the same candle,
+    stop-loss is assumed to occur first.
     """
+
+    entry_row = data.iloc[
+        entry_position
+    ]
+
+    entry_time = data.index[
+        entry_position
+    ]
+
+    entry_price = float(
+        entry_row["Open"]
+    )
+
+    stop_price = (
+        entry_price
+        * (
+            1.0
+            + config.stop_loss_pct
+        )
+    )
+
+    target_price = (
+        entry_price
+        * (
+            1.0
+            - config.take_profit_pct
+        )
+    )
+
+    last_position = min(
+        entry_position
+        + config.max_holding_periods,
+        len(data) - 1,
+    )
+
+    for position in range(
+        entry_position + 1,
+        last_position + 1,
+    ):
+
+        row = data.iloc[
+            position
+        ]
+
+        high = float(
+            row["High"]
+        )
+
+        low = float(
+            row["Low"]
+        )
+
+        timestamp = data.index[
+            position
+        ]
+
+        if high >= stop_price:
+
+            return _exit_trade(
+                direction="SHORT",
+                entry_price=entry_price,
+                exit_price=stop_price,
+                entry_time=entry_time,
+                exit_time=timestamp,
+                holding_periods=(
+                    position
+                    - entry_position
+                ),
+                exit_reason="STOP_LOSS",
+                capital=capital,
+                config=config,
+            )
+
+        if low <= target_price:
+
+            return _exit_trade(
+                direction="SHORT",
+                entry_price=entry_price,
+                exit_price=target_price,
+                entry_time=entry_time,
+                exit_time=timestamp,
+                holding_periods=(
+                    position
+                    - entry_position
+                ),
+                exit_reason="TAKE_PROFIT",
+                capital=capital,
+                config=config,
+            )
+
+    exit_position = last_position
+
+    exit_row = data.iloc[
+        exit_position
+    ]
+
+    return _exit_trade(
+        direction="SHORT",
+        entry_price=entry_price,
+        exit_price=float(
+            exit_row["Close"]
+        ),
+        entry_time=entry_time,
+        exit_time=data.index[
+            exit_position
+        ],
+        holding_periods=(
+            exit_position
+            - entry_position
+        ),
+        exit_reason="TIME_EXIT",
+        capital=capital,
+        config=config,
+    )
+
+
+# ----------------------------------------------------------------------
+# Equity curve
+# ----------------------------------------------------------------------
+
+
+def _equity_curve(
+    data: pd.DataFrame,
+    trades: list[Trade],
+    initial_capital: float,
+) -> pd.DataFrame:
+    """
+    Construct an equity curve from completed trades.
+
+    Since this is a trade-level research engine, unrealized P&L is not
+    marked continuously. Equity changes when a trade is closed.
+    """
+
+    equity = pd.Series(
+        initial_capital,
+        index=data.index,
+        dtype=float,
+    )
+
+    current = float(
+        initial_capital
+    )
+
+    trade_by_exit: dict[
+        pd.Timestamp,
+        list[Trade],
+    ] = {}
+
+    for trade in trades:
+
+        trade_by_exit.setdefault(
+            trade.exit_time,
+            [],
+        ).append(
+            trade
+        )
+
+    for timestamp in data.index:
+
+        if timestamp in trade_by_exit:
+
+            for trade in trade_by_exit[
+                timestamp
+            ]:
+
+                current += trade.pnl
+
+        equity.loc[
+            timestamp
+        ] = current
+
+    running_max = equity.cummax()
+
+    drawdown = (
+        equity
+        / running_max
+        - 1.0
+    )
+
+    return pd.DataFrame(
+        {
+            "Equity": equity,
+            "Drawdown": drawdown,
+        },
+        index=data.index,
+    )
+
+
+# ----------------------------------------------------------------------
+# Performance metrics
+# ----------------------------------------------------------------------
+
+
+def _performance_metrics(
+    trades: list[Trade],
+    equity_curve: pd.DataFrame,
+    initial_capital: float,
+    periods_per_year: int,
+) -> dict:
+    """
+    Calculate statistical and economic backtest metrics.
+    """
+
+    if periods_per_year <= 0:
+        raise ValueError(
+            "periods_per_year must be positive."
+        )
+
+    final_capital = float(
+        equity_curve[
+            "Equity"
+        ].iloc[-1]
+    )
+
+    total_return = (
+        final_capital
+        / initial_capital
+        - 1.0
+    )
+
+    periods = max(
+        len(equity_curve),
+        1,
+    )
+
+    years = (
+        periods
+        / periods_per_year
+    )
+
+    if (
+        years > 0
+        and final_capital > 0
+    ):
+
+        annualized_return = (
+            (
+                final_capital
+                / initial_capital
+            )
+            ** (
+                1.0
+                / years
+            )
+            - 1.0
+        )
+
+    else:
+
+        annualized_return = -1.0
+
+    equity_returns = (
+        equity_curve[
+            "Equity"
+        ]
+        .pct_change()
+        .replace(
+            [
+                np.inf,
+                -np.inf,
+            ],
+            np.nan,
+        )
+        .fillna(0.0)
+    )
+
+    return_std = float(
+        equity_returns.std(
+            ddof=1
+        )
+    )
+
+    if (
+        not np.isfinite(
+            return_std
+        )
+    ):
+        return_std = 0.0
+
+    volatility = float(
+        return_std
+        * np.sqrt(
+            periods_per_year
+        )
+    )
+
+    if return_std > 0:
+
+        sharpe = float(
+            equity_returns.mean()
+            / return_std
+            * np.sqrt(
+                periods_per_year
+            )
+        )
+
+    else:
+
+        sharpe = 0.0
+
+    # --------------------------------------------------------------
+    # Drawdown
+    # --------------------------------------------------------------
+
+    maximum_drawdown = float(
+        equity_curve[
+            "Drawdown"
+        ].min()
+    )
+
+    # --------------------------------------------------------------
+    # Trade returns
+    # --------------------------------------------------------------
+
+    trade_returns = np.asarray(
+        [
+            trade.net_return
+            for trade in trades
+        ],
+        dtype=float,
+    )
+
+    if len(trade_returns) > 0:
+
+        winning = trade_returns[
+            trade_returns > 0
+        ]
+
+        losing = trade_returns[
+            trade_returns < 0
+        ]
+
+        win_rate = float(
+            len(winning)
+            / len(trade_returns)
+        )
+
+        average_trade = float(
+            np.mean(
+                trade_returns
+            )
+        )
+
+        median_trade = float(
+            np.median(
+                trade_returns
+            )
+        )
+
+        best_trade = float(
+            np.max(
+                trade_returns
+            )
+        )
+
+        worst_trade = float(
+            np.min(
+                trade_returns
+            )
+        )
+
+        expectancy = float(
+            average_trade
+        )
+
+    else:
+
+        winning = np.asarray(
+            [],
+            dtype=float,
+        )
+
+        losing = np.asarray(
+            [],
+            dtype=float,
+        )
+
+        win_rate = 0.0
+        average_trade = 0.0
+        median_trade = 0.0
+        best_trade = 0.0
+        worst_trade = 0.0
+        expectancy = 0.0
+
+    # --------------------------------------------------------------
+    # Profit factor
+    # --------------------------------------------------------------
+
+    gross_profit = float(
+        winning.sum()
+    )
+
+    gross_loss = float(
+        abs(
+            losing.sum()
+        )
+    )
+
+    if gross_loss > 0:
+
+        profit_factor = float(
+            gross_profit
+            / gross_loss
+        )
+
+    elif gross_profit > 0:
+
+        profit_factor = float(
+            "inf"
+        )
+
+    else:
+
+        profit_factor = 0.0
+
+    # --------------------------------------------------------------
+    # Downside risk
+    # --------------------------------------------------------------
+
+    negative_returns = (
+        equity_returns[
+            equity_returns < 0
+        ]
+    )
+
+    if len(
+        negative_returns
+    ) > 1:
+
+        downside_deviation = float(
+            negative_returns.std(
+                ddof=1
+            )
+            * np.sqrt(
+                periods_per_year
+            )
+        )
+
+    else:
+
+        downside_deviation = 0.0
+
+    if downside_deviation > 0:
+
+        sortino_ratio = float(
+            equity_returns.mean()
+            * periods_per_year
+            / downside_deviation
+        )
+
+    else:
+
+        sortino_ratio = 0.0
+
+    # --------------------------------------------------------------
+    # Calmar ratio
+    # --------------------------------------------------------------
+
+    if (
+        maximum_drawdown < 0
+        and np.isfinite(
+            annualized_return
+        )
+    ):
+
+        calmar_ratio = float(
+            annualized_return
+            / abs(
+                maximum_drawdown
+            )
+        )
+
+    else:
+
+        calmar_ratio = 0.0
+
+    # --------------------------------------------------------------
+    # Holding period
+    # --------------------------------------------------------------
+
+    average_holding = (
+        float(
+            np.mean(
+                [
+                    trade.holding_periods
+                    for trade in trades
+                ]
+            )
+        )
+        if trades
+        else 0.0
+    )
+
+    # --------------------------------------------------------------
+    # Exposure
+    # --------------------------------------------------------------
+
+    total_periods = len(
+        equity_curve
+    )
+
+    occupied_periods = sum(
+        max(
+            0,
+            trade.holding_periods,
+        )
+        for trade in trades
+    )
+
+    exposure = (
+        float(
+            occupied_periods
+            / total_periods
+        )
+        if total_periods > 0
+        else 0.0
+    )
+
+    exposure = min(
+        max(
+            exposure,
+            0.0,
+        ),
+        1.0,
+    )
+
+    # --------------------------------------------------------------
+    # Costs
+    # --------------------------------------------------------------
+
+    total_transaction_cost = float(
+        sum(
+            trade.transaction_cost
+            * trade.position_value
+            for trade in trades
+        )
+    )
+
+    total_slippage_cost = float(
+        sum(
+            trade.slippage_cost
+            * trade.position_value
+            for trade in trades
+        )
+    )
 
     return {
-        "decision": result.decision.value,
-        "direction": result.direction,
-        "confidence": round(
-            result.confidence,
-            4,
+        "final_capital": final_capital,
+        "total_return": float(
+            total_return
         ),
-        "trade_allowed": result.trade_allowed,
-        "high_confidence": result.high_confidence,
-        "passed_gates": result.positive_gate_count,
-        "failed_gates": result.failed_gate_count,
-        "warnings": len(
-            result.warning_gates()
+        "annualized_return": float(
+            annualized_return
+        ),
+        "volatility": float(
+            volatility
+        ),
+        "sharpe_ratio": float(
+            sharpe
+        ),
+        "maximum_drawdown": float(
+            maximum_drawdown
+        ),
+        "win_rate": float(
+            win_rate
+        ),
+        "profit_factor": float(
+            profit_factor
+        ),
+        "average_trade_return": float(
+            average_trade
+        ),
+        "median_trade_return": float(
+            median_trade
+        ),
+        "trades": len(
+            trades
+        ),
+        "winning_trades": len(
+            winning
+        ),
+        "losing_trades": len(
+            losing
+        ),
+        "average_holding_period": float(
+            average_holding
+        ),
+        "expectancy": float(
+            expectancy
+        ),
+        "downside_deviation": float(
+            downside_deviation
+        ),
+        "sortino_ratio": float(
+            sortino_ratio
+        ),
+        "calmar_ratio": float(
+            calmar_ratio
+        ),
+        "exposure": float(
+            exposure
+        ),
+        "total_transaction_cost": float(
+            total_transaction_cost
+        ),
+        "total_slippage_cost": float(
+            total_slippage_cost
+        ),
+        "best_trade": float(
+            best_trade
+        ),
+        "worst_trade": float(
+            worst_trade
         ),
     }
+
+
+# ----------------------------------------------------------------------
+# Main backtest
+# ----------------------------------------------------------------------
+
+
+def run_backtest(
+    data: pd.DataFrame,
+    probability: Optional[
+        pd.Series
+    ] = None,
+    config: Optional[
+        BacktestConfig
+    ] = None,
+    periods_per_year: int = 252,
+) -> BacktestResult:
+    """
+    Run a historical swing-trading backtest.
+
+    Signal timing
+    -------------
+        Prediction at candle t
+                    ↓
+        Entry at candle t+1 Open
+
+    This prevents same-candle look-ahead from the prediction close.
+
+    Long
+    ----
+        probability >= threshold
+
+    Short
+    -----
+        probability <= 1 - threshold
+
+    Position policy
+    ---------------
+    The current implementation is sequential by design and therefore
+    permits at most one active trade at a time.
+
+    ``max_concurrent_positions`` is retained for compatibility and is
+    validated, but multi-position portfolio accounting is intentionally
+    left for a later portfolio-engine layer.
+    """
+
+    config = (
+        config
+        if config is not None
+        else BacktestConfig()
+    )
+
+    _validate_price_data(
+        data
+    )
+
+    if probability is None:
+
+        if "Probability" not in data.columns:
+
+            raise ValueError(
+                "probability must be supplied when data does not contain "
+                "a 'Probability' column."
+            )
+
+        probability = data[
+            "Probability"
+        ]
+
+    if not isinstance(
+        probability,
+        pd.Series,
+    ):
+
+        probability = pd.Series(
+            probability,
+            index=data.index,
+        )
+
+    _validate_predictions(
+        data,
+        probability,
+    )
+
+    probability = (
+        pd.to_numeric(
+            probability,
+            errors="coerce",
+        )
+        .reindex(
+            data.index
+        )
+    )
+
+    trades: list[Trade] = []
+
+    capital = float(
+        config.initial_capital
+    )
+
+    position = 0
+
+    while position < (
+        len(data) - 1
+    ):
+
+        current_probability = (
+            probability.iloc[
+                position
+            ]
+        )
+
+        if pd.isna(
+            current_probability
+        ):
+
+            position += 1
+            continue
+
+        direction: Optional[
+            str
+        ] = None
+
+        if (
+            config.allow_long
+            and current_probability
+            >= config.probability_threshold
+        ):
+
+            direction = "LONG"
+
+        elif (
+            config.allow_short
+            and current_probability
+            <= (
+                1.0
+                - config.probability_threshold
+            )
+        ):
+
+            direction = "SHORT"
+
+        if direction is None:
+
+            position += 1
+            continue
+
+        # ----------------------------------------------------------
+        # Entry is ALWAYS the next candle.
+        # ----------------------------------------------------------
+
+        entry_position = (
+            position + 1
+        )
+
+        if entry_position >= len(data):
+
+            break
+
+        if direction == "LONG":
+
+            trade = _simulate_long_trade(
+                data=data,
+                entry_position=entry_position,
+                config=config,
+                capital=capital,
+            )
+
+        else:
+
+            trade = _simulate_short_trade(
+                data=data,
+                entry_position=entry_position,
+                config=config,
+                capital=capital,
+            )
+
+        trades.append(
+            trade
+        )
+
+        capital += trade.pnl
+
+        # Find the next available signal after the trade exits.
+        exit_position = (
+            data.index.get_loc(
+                trade.exit_time
+            )
+        )
+
+        position = (
+            exit_position + 1
+        )
+
+    # ------------------------------------------------------------------
+    # Equity curve
+    # ------------------------------------------------------------------
+
+    equity_curve = _equity_curve(
+        data=data,
+        trades=trades,
+        initial_capital=(
+            config.initial_capital
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
+
+    metrics = _performance_metrics(
+        trades=trades,
+        equity_curve=equity_curve,
+        initial_capital=(
+            config.initial_capital
+        ),
+        periods_per_year=(
+            periods_per_year
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Trade dataframe
+    # ------------------------------------------------------------------
+
+    if trades:
+
+        trades_dataframe = pd.DataFrame(
+            [
+                asdict(
+                    trade
+                )
+                for trade in trades
+            ]
+        )
+
+    else:
+
+        trades_dataframe = pd.DataFrame(
+            columns=[
+                field
+                for field
+                in Trade.__dataclass_fields__
+            ]
+        )
+
+    return BacktestResult(
+        initial_capital=(
+            config.initial_capital
+        ),
+        final_capital=(
+            metrics[
+                "final_capital"
+            ]
+        ),
+        total_return=(
+            metrics[
+                "total_return"
+            ]
+        ),
+        annualized_return=(
+            metrics[
+                "annualized_return"
+            ]
+        ),
+        volatility=(
+            metrics[
+                "volatility"
+            ]
+        ),
+        sharpe_ratio=(
+            metrics[
+                "sharpe_ratio"
+            ]
+        ),
+        maximum_drawdown=(
+            metrics[
+                "maximum_drawdown"
+            ]
+        ),
+        win_rate=(
+            metrics[
+                "win_rate"
+            ]
+        ),
+        profit_factor=(
+            metrics[
+                "profit_factor"
+            ]
+        ),
+        average_trade_return=(
+            metrics[
+                "average_trade_return"
+            ]
+        ),
+        median_trade_return=(
+            metrics[
+                "median_trade_return"
+            ]
+        ),
+        trades=(
+            metrics[
+                "trades"
+            ]
+        ),
+        winning_trades=(
+            metrics[
+                "winning_trades"
+            ]
+        ),
+        losing_trades=(
+            metrics[
+                "losing_trades"
+            ]
+        ),
+        average_holding_period=(
+            metrics[
+                "average_holding_period"
+            ]
+        ),
+        trades_dataframe=(
+            trades_dataframe
+        ),
+        equity_curve=(
+            equity_curve
+        ),
+        expectancy=(
+            metrics[
+                "expectancy"
+            ]
+        ),
+        downside_deviation=(
+            metrics[
+                "downside_deviation"
+            ]
+        ),
+        sortino_ratio=(
+            metrics[
+                "sortino_ratio"
+            ]
+        ),
+        calmar_ratio=(
+            metrics[
+                "calmar_ratio"
+            ]
+        ),
+        exposure=(
+            metrics[
+                "exposure"
+            ]
+        ),
+        total_transaction_cost=(
+            metrics[
+                "total_transaction_cost"
+            ]
+        ),
+        total_slippage_cost=(
+            metrics[
+                "total_slippage_cost"
+            ]
+        ),
+        best_trade=(
+            metrics[
+                "best_trade"
+            ]
+        ),
+        worst_trade=(
+            metrics[
+                "worst_trade"
+            ]
+        ),
+    )
+
+
+# ----------------------------------------------------------------------
+# Public compatibility helper
+# ----------------------------------------------------------------------
+
+
+def calculate_position_size(
+    capital: float,
+    entry_price: float,
+    stop_price: float,
+    risk_fraction: float,
+) -> float:
+    """
+    Public compatibility wrapper for fixed-risk long position sizing.
+
+    For short positions, the internal directional sizing function is
+    used by the backtester.
+    """
+
+    return _position_size(
+        capital=capital,
+        entry_price=entry_price,
+        stop_price=stop_price,
+        risk_fraction=risk_fraction,
+    )
 
 
 __all__ = [
-    "Decision",
-    "GateStatus",
-    "GateResult",
-    "DecisionConfig",
-    "DecisionInput",
-    "DecisionResult",
-    "DecisionEngine",
-    "calculate_confidence",
-    "build_decision_input",
-    "decision_to_dict",
-    "gate_summary",
+    "BacktestConfig",
+    "Trade",
+    "BacktestResult",
+    "run_backtest",
+    "calculate_position_size",
 ]
-```
