@@ -44,8 +44,24 @@ def _get_close(df: pd.DataFrame) -> pd.Series:
 class GradientBoostingSwingClassifier:
     """Train a Gradient Boosting model to predict future positive returns."""
 
-    def __init__(self, horizon: int = 5, random_state: int = 42):
+    def __init__(
+        self,
+        horizon: int = 5,
+        probability_threshold: float = 0.60,
+        random_state: int = 42,
+        **kwargs,
+    ):
+        """
+        Initialize the classifier.
+
+        probability_threshold is retained for backward compatibility with
+        the existing predictor. The model itself produces probabilities;
+        the threshold is applied when converting them into a trading signal.
+        Additional legacy keyword arguments are accepted so older predictor
+        code does not break.
+        """
         self.horizon = int(horizon)
+        self.probability_threshold = float(probability_threshold)
         self.random_state = random_state
         self.model = None
         self.feature_columns: list[str] = []
