@@ -1,3 +1,4 @@
+```python
 """
 Final decision and safety gating for AI Swing Analyser.
 
@@ -7,6 +8,10 @@ conservative research-stage decision.
 The gate is intentionally designed to reject weak or contradictory setups.
 It does not guarantee profitability and must never override failed
 validation, leakage checks, calibration, or range-validation checks.
+
+Economic edge is supported as an additional optional gate. It is deliberately
+optional at this stage because the prediction pipeline must first provide
+proper out-of-sample expected-return estimates.
 """
 
 from __future__ import annotations
@@ -62,8 +67,13 @@ class DecisionConfig:
     """
     Configuration for the final decision engine.
 
-    Thresholds are intentionally conservative defaults. They should be
-    optimized only using leakage-free validation data.
+    Thresholds should eventually be selected using leakage-free
+    walk-forward validation rather than manually optimized on the
+    final test set.
+
+    Important:
+        minimum_validation_accuracy is retained for backward compatibility.
+        It is not considered sufficient evidence of profitability.
     """
 
     minimum_probability: float = 0.60
@@ -78,9 +88,33 @@ class DecisionConfig:
 
     minimum_range_coverage: float = 0.70
 
-    minimum_validation_accuracy: float = 0.95
+    # Historical value was 0.95.
+    #
+    # 95% accuracy is not a sensible generic production requirement
+    # for a financial direction classifier. This is temporarily set
+    # to 60% while the research pipeline is upgraded toward:
+    #
+    #   ROC-AUC
+    #   PR-AUC
+    #   Log Loss
+    #   Brier Score
+    #   calibration
+    #   walk-forward validation
+    #   trading expectancy
+    #   drawdown
+    #   robustness
+    #
+    minimum_validation_accuracy: float = 0.60
 
     minimum_regime_stability: float = 0.60
+
+    # Economic edge gate.
+    #
+    # This is NOT mandatory yet. The current predictor pipeline does
+    # not always provide expected-edge information.
+    minimum_expected_edge: float = 0.003
+
+    require_expected_edge: bool = False
 
     allow_buy: bool = True
     allow_sell: bool = True
@@ -124,6 +158,11 @@ class DecisionConfig:
                 "minimum_validation_accuracy cannot be negative."
             )
 
+        if self.minimum_expected_edge < 0.0:
+            raise ValueError(
+                "minimum_expected_edge cannot be negative."
+            )
+
         if self.minimum_positive_gates < 1:
             raise ValueError("minimum_positive_gates must be at least 1.")
 
@@ -135,6 +174,22 @@ class DecisionInput:
 
     Validation flags should come from genuinely unseen research results,
     not from the current prediction itself.
+
+    Economic fields
+    ---------------
+    expected_edge:
+        Expected net return after estimated trading costs.
+
+        Example:
+            0.025 = +2.5%
+
+    expected_gross_return:
+        Expected return before trading costs.
+
+    expected_net_return:
+        Expected return after trading costs.
+
+    These fields are optional until the prediction pipeline is upgraded.
     """
 
     up_probability: float
@@ -169,16 +224,33 @@ class DecisionInput:
     lower_return: Optional[float] = None
     upper_return: Optional[float] = None
 
+    # --------------------------------------------------------------
+    # Economic edge
+    # --------------------------------------------------------------
+
+    expected_edge: Optional[float] = None
+    expected_gross_return: Optional[float] = None
+    expected_net_return: Optional[float] = None
+
     current_price: Optional[float] = None
 
     metadata: Dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self._validate_probability(self.up_probability, "up_probability")
-        self._validate_probability(self.down_probability, "down_probability")
+        self._validate_probability(
+            self.up_probability,
+            "up_probability",
+        )
+
+        self._validate_probability(
+            self.down_probability,
+            "down_probability",
+        )
 
         if not 0.0 <= float(self.model_disagreement) <= 1.0:
-            raise ValueError("model_disagreement must be between 0 and 1.")
+            raise ValueError(
+                "model_disagreement must be between 0 and 1."
+            )
 
         optional_ratios = {
             "model_agreement": self.model_agreement,
@@ -189,22 +261,51 @@ class DecisionInput:
 
         for name, value in optional_ratios.items():
             if value is not None and not 0.0 <= float(value) <= 1.0:
-                raise ValueError(f"{name} must be between 0 and 1.")
+                raise ValueError(
+                    f"{name} must be between 0 and 1."
+                )
 
         if self.risk_reward is not None and self.risk_reward < 0:
-            raise ValueError("risk_reward cannot be negative.")
+            raise ValueError(
+                "risk_reward cannot be negative."
+            )
 
         if self.validation_accuracy is not None:
             if self.validation_accuracy < 0:
-                raise ValueError("validation_accuracy cannot be negative.")
+                raise ValueError(
+                    "validation_accuracy cannot be negative."
+                )
 
-        if self.current_price is not None and self.current_price <= 0:
-            raise ValueError("current_price must be positive.")
+        if self.current_price is not None:
+            if self.current_price <= 0:
+                raise ValueError(
+                    "current_price must be positive."
+                )
+
+        economic_values = {
+            "expected_edge": self.expected_edge,
+            "expected_gross_return": self.expected_gross_return,
+            "expected_net_return": self.expected_net_return,
+            "target_return": self.target_return,
+            "lower_return": self.lower_return,
+            "upper_return": self.upper_return,
+        }
+
+        for name, value in economic_values.items():
+            if value is not None and not math.isfinite(float(value)):
+                raise ValueError(
+                    f"{name} must be finite."
+                )
 
     @staticmethod
-    def _validate_probability(value: float, name: str) -> None:
+    def _validate_probability(
+        value: float,
+        name: str,
+    ) -> None:
         if not 0.0 <= float(value) <= 1.0:
-            raise ValueError(f"{name} must be between 0 and 1.")
+            raise ValueError(
+                f"{name} must be between 0 and 1."
+            )
 
 
 @dataclass
@@ -235,16 +336,26 @@ class DecisionResult:
 
     def passed_gates(self) -> list[GateResult]:
         """Return all passing gates."""
-        return [gate for gate in self.gates if gate.status == GateStatus.PASS]
+        return [
+            gate
+            for gate in self.gates
+            if gate.status == GateStatus.PASS
+        ]
 
     def failed_gates(self) -> list[GateResult]:
         """Return all failed gates."""
-        return [gate for gate in self.gates if gate.status == GateStatus.FAIL]
+        return [
+            gate
+            for gate in self.gates
+            if gate.status == GateStatus.FAIL
+        ]
 
     def warning_gates(self) -> list[GateResult]:
         """Return all warning gates."""
         return [
-            gate for gate in self.gates if gate.status == GateStatus.WARNING
+            gate
+            for gate in self.gates
+            if gate.status == GateStatus.WARNING
         ]
 
 
@@ -253,16 +364,27 @@ class DecisionEngine:
     Conservative final decision engine.
 
     The engine is deliberately deterministic and rule-based at this stage.
-    Machine learning should produce the underlying probabilities/ranges;
-    this module decides whether those outputs satisfy the research safety
-    constraints.
 
-    Important:
-        This engine does not train models and does not claim that a BUY or
-        SELL decision will be profitable.
+    Machine learning should produce:
+
+        - probabilities
+        - expected returns
+        - price ranges
+        - regime information
+
+    This module decides whether those outputs satisfy the research
+    safety constraints.
+
+    Important
+    ---------
+    This engine does not train models and does not claim that a BUY or
+    SELL decision will be profitable.
     """
 
-    def __init__(self, config: Optional[DecisionConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[DecisionConfig] = None,
+    ) -> None:
         self.config = config or DecisionConfig()
 
     def evaluate(
@@ -275,11 +397,14 @@ class DecisionEngine:
         reasons: list[str] = []
         warnings: list[str] = []
 
-        direction, confidence = self._determine_direction(inputs)
+        direction, confidence = self._determine_direction(
+            inputs
+        )
 
         # --------------------------------------------------------------
         # 1. Probability gate
         # --------------------------------------------------------------
+
         gates.append(
             self._probability_gate(
                 direction=direction,
@@ -290,65 +415,123 @@ class DecisionEngine:
         # --------------------------------------------------------------
         # 2. Model agreement/disagreement
         # --------------------------------------------------------------
-        gates.append(self._agreement_gate(inputs))
+
+        gates.append(
+            self._agreement_gate(
+                inputs
+            )
+        )
 
         # --------------------------------------------------------------
         # 3. Multi-timeframe alignment
         # --------------------------------------------------------------
-        gates.append(self._timeframe_gate(inputs))
+
+        gates.append(
+            self._timeframe_gate(
+                inputs
+            )
+        )
 
         # --------------------------------------------------------------
         # 4. Risk/reward
         # --------------------------------------------------------------
-        gates.append(self._risk_reward_gate(inputs))
+
+        gates.append(
+            self._risk_reward_gate(
+                inputs
+            )
+        )
 
         # --------------------------------------------------------------
         # 5. Price-range validation
         # --------------------------------------------------------------
-        gates.append(self._range_gate(inputs))
+
+        gates.append(
+            self._range_gate(
+                inputs
+            )
+        )
 
         # --------------------------------------------------------------
         # 6. Historical model validation
         # --------------------------------------------------------------
-        gates.append(self._validation_gate(inputs))
+
+        gates.append(
+            self._validation_gate(
+                inputs
+            )
+        )
 
         # --------------------------------------------------------------
         # 7. Probability calibration
         # --------------------------------------------------------------
-        gates.append(self._calibration_gate(inputs))
+
+        gates.append(
+            self._calibration_gate(
+                inputs
+            )
+        )
 
         # --------------------------------------------------------------
         # 8. Market-regime stability
         # --------------------------------------------------------------
-        gates.append(self._regime_gate(inputs))
+
+        gates.append(
+            self._regime_gate(
+                inputs
+            )
+        )
+
+        # --------------------------------------------------------------
+        # 9. Economic edge
+        # --------------------------------------------------------------
+
+        gates.append(
+            self._edge_gate(
+                inputs
+            )
+        )
 
         for gate in gates:
+
             if gate.status == GateStatus.FAIL:
-                reasons.append(gate.reason)
+                reasons.append(
+                    gate.reason
+                )
 
             elif gate.status == GateStatus.WARNING:
-                warnings.append(gate.reason)
+                warnings.append(
+                    gate.reason
+                )
 
             elif gate.status == GateStatus.PASS:
-                reasons.append(gate.reason)
+                reasons.append(
+                    gate.reason
+                )
 
         positive_gate_count = sum(
-            gate.status == GateStatus.PASS for gate in gates
+            gate.status == GateStatus.PASS
+            for gate in gates
         )
 
         failed_gate_count = sum(
-            gate.status == GateStatus.FAIL for gate in gates
+            gate.status == GateStatus.FAIL
+            for gate in gates
         )
 
         # Critical safety conditions.
-        critical_failure = self._has_critical_failure(gates)
+        critical_failure = self._has_critical_failure(
+            gates
+        )
 
         enough_positive_gates = (
-            positive_gate_count >= self.config.minimum_positive_gates
+            positive_gate_count
+            >= self.config.minimum_positive_gates
         )
 
         high_confidence = (
-            confidence >= self.config.high_confidence_probability
+            confidence
+            >= self.config.high_confidence_probability
             and enough_positive_gates
             and failed_gate_count == 0
         )
@@ -360,18 +543,25 @@ class DecisionEngine:
         )
 
         if critical_failure:
+
             final_decision = Decision.REJECTED
 
         elif not trade_allowed:
-            final_decision = Decision.NO_HIGH_CONFIDENCE_SETUP
+
+            final_decision = (
+                Decision.NO_HIGH_CONFIDENCE_SETUP
+            )
 
         elif direction == "BUY":
+
             final_decision = Decision.BUY
 
         elif direction == "SELL":
+
             final_decision = Decision.SELL
 
         else:
+
             final_decision = Decision.WAIT
 
         return DecisionResult(
@@ -389,6 +579,13 @@ class DecisionEngine:
                 "market_regime": inputs.market_regime,
                 "up_probability": inputs.up_probability,
                 "down_probability": inputs.down_probability,
+                "expected_edge": inputs.expected_edge,
+                "expected_gross_return": (
+                    inputs.expected_gross_return
+                ),
+                "expected_net_return": (
+                    inputs.expected_net_return
+                ),
             },
         )
 
@@ -403,26 +600,43 @@ class DecisionEngine:
         """
         Determine dominant direction.
 
-        A probability difference below the minimum threshold produces WAIT.
+        A probability below the minimum threshold produces WAIT.
         """
 
-        up = float(inputs.up_probability)
-        down = float(inputs.down_probability)
+        up = float(
+            inputs.up_probability
+        )
+
+        down = float(
+            inputs.down_probability
+        )
 
         if up >= down:
+
             direction = "BUY"
             confidence = up
+
         else:
+
             direction = "SELL"
             confidence = down
 
         if confidence < self.config.minimum_probability:
+
             return "WAIT", confidence
 
-        if direction == "BUY" and not self.config.allow_buy:
+        if (
+            direction == "BUY"
+            and not self.config.allow_buy
+        ):
+
             return "WAIT", confidence
 
-        if direction == "SELL" and not self.config.allow_sell:
+        if (
+            direction == "SELL"
+            and not self.config.allow_sell
+        ):
+
             return "WAIT", confidence
 
         return direction, confidence
@@ -436,21 +650,30 @@ class DecisionEngine:
         direction: str,
         confidence: float,
     ) -> GateResult:
+
         if direction == "WAIT":
+
             return GateResult(
                 name="direction_probability",
                 status=GateStatus.FAIL,
                 score=confidence,
                 reason=(
-                    f"Directional probability {confidence:.1%} is below "
+                    f"Directional probability "
+                    f"{confidence:.1%} is below "
                     f"the minimum threshold of "
                     f"{self.config.minimum_probability:.1%}."
                 ),
             )
 
-        if confidence >= self.config.high_confidence_probability:
+        if (
+            confidence
+            >= self.config.high_confidence_probability
+        ):
+
             status = GateStatus.PASS
+
         else:
+
             status = GateStatus.WARNING
 
         return GateResult(
@@ -458,7 +681,8 @@ class DecisionEngine:
             status=status,
             score=confidence,
             reason=(
-                f"{direction} probability is {confidence:.1%}."
+                f"{direction} probability is "
+                f"{confidence:.1%}."
             ),
         )
 
@@ -466,33 +690,52 @@ class DecisionEngine:
         self,
         inputs: DecisionInput,
     ) -> GateResult:
-        disagreement = float(inputs.model_disagreement)
+
+        disagreement = float(
+            inputs.model_disagreement
+        )
 
         if inputs.model_agreement is not None:
-            agreement = float(inputs.model_agreement)
+
+            agreement = float(
+                inputs.model_agreement
+            )
+
         else:
+
             agreement = 1.0 - disagreement
 
-        if disagreement > self.config.maximum_model_disagreement:
+        if (
+            disagreement
+            > self.config.maximum_model_disagreement
+        ):
+
             return GateResult(
                 name="model_agreement",
                 status=GateStatus.FAIL,
                 score=agreement,
                 reason=(
-                    f"Model disagreement is {disagreement:.1%}, exceeding "
+                    f"Model disagreement is "
+                    f"{disagreement:.1%}, exceeding "
                     f"the maximum allowed "
                     f"{self.config.maximum_model_disagreement:.1%}."
                 ),
             )
 
-        if agreement < self.config.minimum_model_agreement:
+        if (
+            agreement
+            < self.config.minimum_model_agreement
+        ):
+
             return GateResult(
                 name="model_agreement",
                 status=GateStatus.FAIL,
                 score=agreement,
                 reason=(
-                    f"Model agreement is {agreement:.1%}, below the "
-                    f"required {self.config.minimum_model_agreement:.1%}."
+                    f"Model agreement is "
+                    f"{agreement:.1%}, below the "
+                    f"required "
+                    f"{self.config.minimum_model_agreement:.1%}."
                 ),
             )
 
@@ -500,34 +743,48 @@ class DecisionEngine:
             name="model_agreement",
             status=GateStatus.PASS,
             score=agreement,
-            reason=f"Models agree at approximately {agreement:.1%}.",
+            reason=(
+                f"Models agree at approximately "
+                f"{agreement:.1%}."
+            ),
         )
 
     def _timeframe_gate(
         self,
         inputs: DecisionInput,
     ) -> GateResult:
+
         if inputs.timeframe_alignment is None:
+
             return GateResult(
                 name="multi_timeframe_alignment",
                 status=GateStatus.NOT_EVALUATED,
                 score=0.0,
                 reason=(
-                    "Multi-timeframe alignment was not available. "
-                    "No additional confirmation was granted."
+                    "Multi-timeframe alignment was "
+                    "not available. No additional "
+                    "confirmation was granted."
                 ),
             )
 
-        alignment = float(inputs.timeframe_alignment)
+        alignment = float(
+            inputs.timeframe_alignment
+        )
 
-        if alignment < self.config.minimum_timeframe_alignment:
+        if (
+            alignment
+            < self.config.minimum_timeframe_alignment
+        ):
+
             return GateResult(
                 name="multi_timeframe_alignment",
                 status=GateStatus.FAIL,
                 score=alignment,
                 reason=(
-                    f"Multi-timeframe alignment is {alignment:.1%}, below "
-                    f"the required {self.config.minimum_timeframe_alignment:.1%}."
+                    f"Multi-timeframe alignment is "
+                    f"{alignment:.1%}, below the "
+                    f"required "
+                    f"{self.config.minimum_timeframe_alignment:.1%}."
                 ),
             )
 
@@ -535,27 +792,40 @@ class DecisionEngine:
             name="multi_timeframe_alignment",
             status=GateStatus.PASS,
             score=alignment,
-            reason=f"Multi-timeframe alignment is {alignment:.1%}.",
+            reason=(
+                f"Multi-timeframe alignment is "
+                f"{alignment:.1%}."
+            ),
         )
 
     def _risk_reward_gate(
         self,
         inputs: DecisionInput,
     ) -> GateResult:
+
         if inputs.risk_reward is None:
+
             return GateResult(
                 name="risk_reward",
                 status=GateStatus.NOT_EVALUATED,
                 score=0.0,
                 reason=(
-                    "Risk/reward has not been calculated. "
-                    "A trade should not receive high-confidence status."
+                    "Risk/reward has not been "
+                    "calculated. A trade should "
+                    "not receive high-confidence "
+                    "status."
                 ),
             )
 
-        rr = float(inputs.risk_reward)
+        rr = float(
+            inputs.risk_reward
+        )
 
-        if rr < self.config.minimum_risk_reward:
+        if (
+            rr
+            < self.config.minimum_risk_reward
+        ):
+
             return GateResult(
                 name="risk_reward",
                 status=GateStatus.FAIL,
@@ -564,7 +834,8 @@ class DecisionEngine:
                     self.config.minimum_risk_reward,
                 ),
                 reason=(
-                    f"Risk/reward of {rr:.2f} is below the required "
+                    f"Risk/reward of {rr:.2f} "
+                    f"is below the required "
                     f"{self.config.minimum_risk_reward:.2f}."
                 ),
             )
@@ -573,43 +844,60 @@ class DecisionEngine:
             name="risk_reward",
             status=GateStatus.PASS,
             score=1.0,
-            reason=f"Risk/reward is {rr:.2f}.",
+            reason=(
+                f"Risk/reward is {rr:.2f}."
+            ),
         )
 
     def _range_gate(
         self,
         inputs: DecisionInput,
     ) -> GateResult:
+
         if not inputs.range_validation_available:
+
             return GateResult(
                 name="range_validation",
                 status=GateStatus.NOT_EVALUATED,
                 score=0.0,
                 reason=(
-                    "Price-range validation is not available. "
-                    "Range reliability has not been established."
+                    "Price-range validation is not "
+                    "available. Range reliability "
+                    "has not been established."
                 ),
             )
 
         if not inputs.range_validation_passed:
+
             return GateResult(
                 name="range_validation",
                 status=GateStatus.FAIL,
                 score=0.0,
-                reason="Predicted price-range validation failed.",
+                reason=(
+                    "Predicted price-range "
+                    "validation failed."
+                ),
             )
 
         if inputs.range_coverage is not None:
-            coverage = float(inputs.range_coverage)
 
-            if coverage < self.config.minimum_range_coverage:
+            coverage = float(
+                inputs.range_coverage
+            )
+
+            if (
+                coverage
+                < self.config.minimum_range_coverage
+            ):
+
                 return GateResult(
                     name="range_validation",
                     status=GateStatus.FAIL,
                     score=coverage,
                     reason=(
-                        f"Observed range coverage of {coverage:.1%} is "
-                        f"below the minimum "
+                        f"Observed range coverage "
+                        f"of {coverage:.1%} is below "
+                        f"the minimum "
                         f"{self.config.minimum_range_coverage:.1%}."
                     ),
                 )
@@ -619,7 +907,8 @@ class DecisionEngine:
                 status=GateStatus.PASS,
                 score=coverage,
                 reason=(
-                    f"Predicted range validation passed with "
+                    f"Predicted range validation "
+                    f"passed with "
                     f"{coverage:.1%} coverage."
                 ),
             )
@@ -628,21 +917,28 @@ class DecisionEngine:
             name="range_validation",
             status=GateStatus.PASS,
             score=1.0,
-            reason="Predicted range validation passed.",
+            reason=(
+                "Predicted price-range "
+                "validation passed."
+            ),
         )
 
     def _validation_gate(
         self,
         inputs: DecisionInput,
     ) -> GateResult:
+
         if not inputs.validation_available:
+
             if self.config.require_validation_pass:
+
                 return GateResult(
                     name="historical_validation",
                     status=GateStatus.FAIL,
                     score=0.0,
                     reason=(
-                        "No qualifying historical out-of-sample validation "
+                        "No qualifying historical "
+                        "out-of-sample validation "
                         "result is available."
                     ),
                 )
@@ -651,27 +947,47 @@ class DecisionEngine:
                 name="historical_validation",
                 status=GateStatus.WARNING,
                 score=0.0,
-                reason="Historical validation was not available.",
+                reason=(
+                    "Historical validation was "
+                    "not available."
+                ),
             )
 
         if not inputs.validation_passed:
+
             return GateResult(
                 name="historical_validation",
                 status=GateStatus.FAIL,
                 score=0.0,
-                reason="Historical validation gate failed.",
+                reason=(
+                    "Historical validation gate failed."
+                ),
             )
 
         if inputs.validation_accuracy is not None:
-            accuracy = float(inputs.validation_accuracy)
 
-            if accuracy < self.config.minimum_validation_accuracy:
+            accuracy = float(
+                inputs.validation_accuracy
+            )
+
+            if (
+                accuracy
+                < self.config.minimum_validation_accuracy
+            ):
+
                 return GateResult(
                     name="historical_validation",
                     status=GateStatus.FAIL,
-                    score=min(accuracy, 1.0),
+                    score=min(
+                        max(
+                            accuracy,
+                            0.0,
+                        ),
+                        1.0,
+                    ),
                     reason=(
-                        f"Validation accuracy {accuracy:.1%} is below "
+                        f"Validation accuracy "
+                        f"{accuracy:.1%} is below "
                         f"the research threshold "
                         f"{self.config.minimum_validation_accuracy:.1%}."
                     ),
@@ -680,10 +996,19 @@ class DecisionEngine:
             return GateResult(
                 name="historical_validation",
                 status=GateStatus.PASS,
-                score=min(accuracy, 1.0),
+                score=min(
+                    max(
+                        accuracy,
+                        0.0,
+                    ),
+                    1.0,
+                ),
                 reason=(
-                    f"Historical validation passed with "
-                    f"{accuracy:.1%} accuracy."
+                    f"Historical validation "
+                    f"passed with "
+                    f"{accuracy:.1%} accuracy. "
+                    f"Accuracy alone is not "
+                    f"evidence of profitability."
                 ),
             )
 
@@ -691,21 +1016,27 @@ class DecisionEngine:
             name="historical_validation",
             status=GateStatus.PASS,
             score=1.0,
-            reason="Historical validation gate passed.",
+            reason=(
+                "Historical validation gate passed."
+            ),
         )
 
     def _calibration_gate(
         self,
         inputs: DecisionInput,
     ) -> GateResult:
+
         if not inputs.calibration_available:
+
             if self.config.require_calibration_pass:
+
                 return GateResult(
                     name="probability_calibration",
                     status=GateStatus.FAIL,
                     score=0.0,
                     reason=(
-                        "Probability calibration has not been independently "
+                        "Probability calibration "
+                        "has not been independently "
                         "validated."
                     ),
                 )
@@ -714,36 +1045,48 @@ class DecisionEngine:
                 name="probability_calibration",
                 status=GateStatus.WARNING,
                 score=0.0,
-                reason="Probability calibration was not available.",
+                reason=(
+                    "Probability calibration "
+                    "was not available."
+                ),
             )
 
         if not inputs.calibration_passed:
+
             return GateResult(
                 name="probability_calibration",
                 status=GateStatus.FAIL,
                 score=0.0,
-                reason="Probability calibration failed.",
+                reason=(
+                    "Probability calibration failed."
+                ),
             )
 
         return GateResult(
             name="probability_calibration",
             status=GateStatus.PASS,
             score=1.0,
-            reason="Probability calibration passed.",
+            reason=(
+                "Probability calibration passed."
+            ),
         )
 
     def _regime_gate(
         self,
         inputs: DecisionInput,
     ) -> GateResult:
+
         if not inputs.regime_validation_available:
+
             if self.config.require_regime_validation_pass:
+
                 return GateResult(
                     name="regime_stability",
                     status=GateStatus.FAIL,
                     score=0.0,
                     reason=(
-                        "Regime-specific validation is not available."
+                        "Regime-specific validation "
+                        "is not available."
                     ),
                 )
 
@@ -751,15 +1094,21 @@ class DecisionEngine:
                 name="regime_stability",
                 status=GateStatus.WARNING,
                 score=0.0,
-                reason="Regime validation was not available.",
+                reason=(
+                    "Regime validation was "
+                    "not available."
+                ),
             )
 
         if not inputs.regime_validation_passed:
+
             return GateResult(
                 name="regime_stability",
                 status=GateStatus.FAIL,
                 score=0.0,
-                reason="Regime stability validation failed.",
+                reason=(
+                    "Regime stability validation failed."
+                ),
             )
 
         stability = (
@@ -768,14 +1117,20 @@ class DecisionEngine:
             else 1.0
         )
 
-        if stability < self.config.minimum_regime_stability:
+        if (
+            stability
+            < self.config.minimum_regime_stability
+        ):
+
             return GateResult(
                 name="regime_stability",
                 status=GateStatus.FAIL,
                 score=stability,
                 reason=(
-                    f"Regime stability score {stability:.1%} is below "
-                    f"the required {self.config.minimum_regime_stability:.1%}."
+                    f"Regime stability score "
+                    f"{stability:.1%} is below "
+                    f"the required "
+                    f"{self.config.minimum_regime_stability:.1%}."
                 ),
             )
 
@@ -784,7 +1139,120 @@ class DecisionEngine:
             status=GateStatus.PASS,
             score=stability,
             reason=(
-                f"Regime stability score is {stability:.1%}."
+                f"Regime stability score "
+                f"is {stability:.1%}."
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Economic edge
+    # ------------------------------------------------------------------
+
+    def _edge_gate(
+        self,
+        inputs: DecisionInput,
+    ) -> GateResult:
+        """
+        Evaluate expected economic edge.
+
+        Expected edge is expressed as a decimal return.
+
+        Examples:
+
+            0.010 = +1.0%
+            0.025 = +2.5%
+            -0.005 = -0.5%
+
+        The edge gate is optional until the prediction layer supplies
+        a reliable out-of-sample expected return estimate.
+        """
+
+        if inputs.expected_edge is None:
+
+            if self.config.require_expected_edge:
+
+                return GateResult(
+                    name="expected_edge",
+                    status=GateStatus.FAIL,
+                    score=0.0,
+                    reason=(
+                        "Expected economic edge is "
+                        "required but was not provided."
+                    ),
+                )
+
+            return GateResult(
+                name="expected_edge",
+                status=GateStatus.NOT_EVALUATED,
+                score=0.0,
+                reason=(
+                    "Expected economic edge is not "
+                    "available. The economic gate "
+                    "was therefore not used."
+                ),
+            )
+
+        edge = float(
+            inputs.expected_edge
+        )
+
+        if not math.isfinite(edge):
+
+            return GateResult(
+                name="expected_edge",
+                status=GateStatus.FAIL,
+                score=0.0,
+                reason=(
+                    "Expected economic edge "
+                    "is not finite."
+                ),
+            )
+
+        minimum_edge = float(
+            self.config.minimum_expected_edge
+        )
+
+        if minimum_edge <= 0:
+
+            score = (
+                1.0
+                if edge >= 0
+                else 0.0
+            )
+
+        else:
+
+            score = max(
+                0.0,
+                min(
+                    1.0,
+                    edge / minimum_edge,
+                ),
+            )
+
+        if edge < minimum_edge:
+
+            return GateResult(
+                name="expected_edge",
+                status=GateStatus.FAIL,
+                score=score,
+                reason=(
+                    f"Expected net edge is "
+                    f"{edge:.2%}, below the "
+                    f"minimum required "
+                    f"{minimum_edge:.2%}."
+                ),
+            )
+
+        return GateResult(
+            name="expected_edge",
+            status=GateStatus.PASS,
+            score=score,
+            reason=(
+                f"Expected net edge is "
+                f"{edge:.2%}, above the "
+                f"minimum required "
+                f"{minimum_edge:.2%}."
             ),
         )
 
@@ -796,12 +1264,20 @@ class DecisionEngine:
         self,
         gates: Iterable[GateResult],
     ) -> bool:
+
         critical_gate_names = {
             "historical_validation",
             "probability_calibration",
             "range_validation",
             "regime_stability",
         }
+
+        # Economic edge is critical only when explicitly required.
+        if self.config.require_expected_edge:
+
+            critical_gate_names.add(
+                "expected_edge"
+            )
 
         return any(
             gate.name in critical_gate_names
@@ -814,10 +1290,17 @@ class DecisionEngine:
         actual: float,
         required: float,
     ) -> float:
+
         if required <= 0:
             return 1.0
 
-        return max(0.0, min(1.0, actual / required))
+        return max(
+            0.0,
+            min(
+                1.0,
+                actual / required,
+            ),
+        )
 
 
 def calculate_confidence(
@@ -836,20 +1319,32 @@ def calculate_confidence(
     """
 
     if not 0.0 <= up_probability <= 1.0:
-        raise ValueError("up_probability must be between 0 and 1.")
+
+        raise ValueError(
+            "up_probability must be between 0 and 1."
+        )
 
     if not 0.0 <= down_probability <= 1.0:
-        raise ValueError("down_probability must be between 0 and 1.")
+
+        raise ValueError(
+            "down_probability must be between 0 and 1."
+        )
 
     if not 0.0 <= model_disagreement <= 1.0:
-        raise ValueError("model_disagreement must be between 0 and 1.")
+
+        raise ValueError(
+            "model_disagreement must be between 0 and 1."
+        )
 
     directional_strength = max(
         up_probability,
         down_probability,
     )
 
-    agreement_strength = 1.0 - model_disagreement
+    agreement_strength = (
+        1.0
+        - model_disagreement
+    )
 
     components = [
         directional_strength,
@@ -857,14 +1352,21 @@ def calculate_confidence(
     ]
 
     if timeframe_alignment is not None:
+
         if not 0.0 <= timeframe_alignment <= 1.0:
+
             raise ValueError(
                 "timeframe_alignment must be between 0 and 1."
             )
 
-        components.append(timeframe_alignment)
+        components.append(
+            timeframe_alignment
+        )
 
-    return float(sum(components) / len(components))
+    return float(
+        sum(components)
+        / len(components)
+    )
 
 
 def build_decision_input(
@@ -889,8 +1391,13 @@ def build_decision_input(
     target_return: Optional[float] = None,
     lower_return: Optional[float] = None,
     upper_return: Optional[float] = None,
+    expected_edge: Optional[float] = None,
+    expected_gross_return: Optional[float] = None,
+    expected_net_return: Optional[float] = None,
     current_price: Optional[float] = None,
-    metadata: Optional[Mapping[str, object]] = None,
+    metadata: Optional[
+        Mapping[str, object]
+    ] = None,
 ) -> DecisionInput:
     """
     Convenience constructor for DecisionInput.
@@ -917,15 +1424,22 @@ def build_decision_input(
         target_return=target_return,
         lower_return=lower_return,
         upper_return=upper_return,
+        expected_edge=expected_edge,
+        expected_gross_return=expected_gross_return,
+        expected_net_return=expected_net_return,
         current_price=current_price,
-        metadata=dict(metadata or {}),
+        metadata=dict(
+            metadata or {}
+        ),
     )
 
 
 def decision_to_dict(
     result: DecisionResult,
 ) -> Dict[str, object]:
-    """Convert a DecisionResult into a serializable dictionary."""
+    """
+    Convert a DecisionResult into a serializable dictionary.
+    """
 
     return {
         "decision": result.decision.value,
@@ -935,8 +1449,12 @@ def decision_to_dict(
         "failed_gate_count": result.failed_gate_count,
         "trade_allowed": result.trade_allowed,
         "high_confidence": result.high_confidence,
-        "reasons": list(result.reasons),
-        "warnings": list(result.warnings),
+        "reasons": list(
+            result.reasons
+        ),
+        "warnings": list(
+            result.warnings
+        ),
         "gates": [
             {
                 "name": gate.name,
@@ -946,24 +1464,33 @@ def decision_to_dict(
             }
             for gate in result.gates
         ],
-        "metadata": dict(result.metadata),
+        "metadata": dict(
+            result.metadata
+        ),
     }
 
 
 def gate_summary(
     result: DecisionResult,
 ) -> Dict[str, object]:
-    """Return a compact summary suitable for a dashboard."""
+    """
+    Return a compact summary suitable for a dashboard.
+    """
 
     return {
         "decision": result.decision.value,
         "direction": result.direction,
-        "confidence": round(result.confidence, 4),
+        "confidence": round(
+            result.confidence,
+            4,
+        ),
         "trade_allowed": result.trade_allowed,
         "high_confidence": result.high_confidence,
         "passed_gates": result.positive_gate_count,
         "failed_gates": result.failed_gate_count,
-        "warnings": len(result.warning_gates()),
+        "warnings": len(
+            result.warning_gates()
+        ),
     }
 
 
@@ -980,3 +1507,4 @@ __all__ = [
     "decision_to_dict",
     "gate_summary",
 ]
+```
