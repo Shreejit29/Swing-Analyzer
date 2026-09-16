@@ -1,66 +1,68 @@
 """
-Feature engineering package for the AI Swing Stock Analyzer.
+Data package for the AI Swing Stock Analyzer.
 
-The package contains independent feature modules for:
-
-- Technical indicators
-- Price action
-- Volume analysis
-- Market regime
-- Multi-timeframe analysis
-
-The main feature pipeline is exposed through ``engine.py``.
+Provides:
+- Yahoo Finance data downloading
+- Market context analysis
+- Sector analysis
 """
 
-from .engine import (
-    build_features,
-    feature_columns,
-    normalize_ohlcv,
-    prepare_model_data,
+from .downloader import (
+    download_data,
 )
 
-from .technical import add_technical_features
-
-from .price_action import add_price_action_features
-
-from .volume import add_volume_features
-
-from .regime import (
-    add_regime_features,
-    detect_regime,
-    market_regime,
-    get_regime_score,
+from .market import (
+    market_trend,
+    market_momentum,
+    market_volatility,
+    market_strength,
+    market_volume,
+    market_summary,
+    get_market_trend,
+    get_market_momentum,
+    get_market_summary,
+    get_market_strength,
 )
 
-from .multi_timeframe import (
-    add_multi_timeframe_features,
-    add_mtf_features,
+from .sector import (
+    get_sector,
+    sector_info,
+    sector_performance,
+    sector_score,
+    sector_summary,
+    get_sector_name,
+    get_sector_info,
+    get_sector_performance,
+    get_sector_score,
+    get_sector_summary,
 )
 
 
 __all__ = [
-    # Engine
-    "build_features",
-    "feature_columns",
-    "normalize_ohlcv",
-    "prepare_model_data",
+    # Downloader
+    "download_data",
 
-    # Technical
-    "add_technical_features",
+    # Market
+    "market_trend",
+    "market_momentum",
+    "market_volatility",
+    "market_strength",
+    "market_volume",
+    "market_summary",
+    "get_market_trend",
+    "get_market_momentum",
+    "get_market_summary",
+    "get_market_strength",
 
-    # Price action
-    "add_price_action_features",
-
-    # Volume
-    "add_volume_features",
-
-    # Regime
-    "add_regime_features",
-    "detect_regime",
-    "market_regime",
-    "get_regime_score",
-
-    # Multi-timeframe
-    "add_multi_timeframe_features",
-    "add_mtf_features",
+    # Sector
+    "get_sector",
+    "sector_info",
+    "sector_performance",
+    "sector_score",
+    "sector_summary",
+    "get_sector_name",
+    "get_sector_info",
+    "get_sector_performance",
+    "get_sector_score",
+    "get_sector_summary",
 ]
