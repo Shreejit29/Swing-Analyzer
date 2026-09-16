@@ -579,10 +579,67 @@ class EnsembleSwingClassifier:
             except Exception:
                 component_auc = np.nan
 
+            # Full out-of-fold component diagnostics. These metrics are
+            # calculated only on observations that were not used to fit the
+            # corresponding fold model.
+            component_pred = (prob >= 0.50).astype(int)
+
+            try:
+                component_accuracy = float(
+                    accuracy_score(actual, component_pred)
+                )
+            except Exception:
+                component_accuracy = np.nan
+
+            try:
+                component_precision = float(
+                    precision_score(
+                        actual,
+                        component_pred,
+                        zero_division=0,
+                    )
+                )
+            except Exception:
+                component_precision = np.nan
+
+            try:
+                component_recall = float(
+                    recall_score(
+                        actual,
+                        component_pred,
+                        zero_division=0,
+                    )
+                )
+            except Exception:
+                component_recall = np.nan
+
+            try:
+                component_f1 = float(
+                    f1_score(
+                        actual,
+                        component_pred,
+                        zero_division=0,
+                    )
+                )
+            except Exception:
+                component_f1 = np.nan
+
+            try:
+                component_brier = float(
+                    brier_score_loss(actual, prob)
+                )
+            except Exception:
+                component_brier = np.nan
+
             metrics[name] = {
                 "oof_samples": int(mask.sum()),
-                "log_loss": component_logloss,
+                "accuracy": component_accuracy,
+                "precision": component_precision,
+                "recall": component_recall,
+                "f1": component_f1,
                 "roc_auc": component_auc,
+                "brier": component_brier,
+                "log_loss": component_logloss,
             }
 
         self.component_validation_metrics_ = metrics
