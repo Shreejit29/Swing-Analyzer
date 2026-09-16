@@ -20,6 +20,7 @@ OHLCV
 from __future__ import annotations
 
 from typing import Any, Dict
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -38,6 +39,8 @@ from src.data.sector import get_sector, sector_summary
 # create a brand-new decision. Backtesting does not use this state.
 _SIGNAL_ENGINES: Dict[str, SignalStabilityEngine] = {}
 _SIGNAL_LAST_OBSERVATION: Dict[str, str] = {}
+_SIGNAL_LAST_PROBABILITY: Dict[str, float] = {}
+_SIGNAL_LAST_TIMESTAMP: Dict[str, str] = {}
 
 
 def _get_signal_engine(ticker: str, horizon: int) -> SignalStabilityEngine:
@@ -1920,6 +1923,22 @@ def analyze_stock(
     observation_id = _latest_observation_id(features)
     engine_key = f"{str(ticker).upper().strip()}::{int(horizon)}"
     previous_observation = _SIGNAL_LAST_OBSERVATION.get(engine_key)
+    previous_probability = _SIGNAL_LAST_PROBABILITY.get(engine_key)
+    prediction_timestamp = datetime.now(timezone.utc).isoformat()
+    probability_change = (
+        float(final_probability - previous_probability)
+        if previous_probability is not None
+        else None
+    )
+
+    if previous_observation is None:
+        prediction_status = "FRESH"
+    elif observation_id == previous_observation:
+        prediction_status = "STABLE OBSERVATION"
+    elif probability_change is not None and abs(probability_change) < 0.015:
+        prediction_status = "STABLE"
+    else:
+        prediction_status = "CHANGED"
 
     regime_score = 0.0
     regime_upper = str(regime).upper()
@@ -1973,6 +1992,12 @@ def analyze_stock(
     final_signal = str(
         stable_decision.get("signal", filtered_signal)
     )
+
+    # Persist the latest observation metadata only after the decision has
+    # been computed. This lets repeated Streamlit refreshes distinguish a
+    # genuinely new market observation from a rerun of the same observation.
+    _SIGNAL_LAST_PROBABILITY[engine_key] = float(final_probability)
+    _SIGNAL_LAST_TIMESTAMP[engine_key] = prediction_timestamp
 
     # ================================================================
     # 90% CONFIDENCE EVIDENCE GATE
@@ -2076,6 +2101,18 @@ def analyze_stock(
     model_summary = model.summary()
 
     try:
+        model_summary["prediction_status"] = prediction_status
+        model_summary["prediction_observation_id"] = observation_id
+        model_summary["prediction_timestamp"] = prediction_timestamp
+        model_summary["prediction_probability_change"] = (
+            float(probability_change)
+            if probability_change is not None
+            else None
+        )
+    except Exception:
+        pass
+
+    try:
         model_summary["adaptive_evidence_score"] = float(
             adaptive_confidence.get("evidence_score", 0.0)
         )
@@ -2131,6 +2168,40 @@ def analyze_stock(
             "signal_pending_count": int(
                 stable_decision.get("pending_count", 0)
             ),
+
+            # --------------------------------------------------------
+            # PREDICTION SNAPSHOT / CONSISTENCY
+            # --------------------------------------------------------
+
+            "prediction_timestamp": prediction_timestamp,
+
+            "prediction_observation_id": observation_id,
+
+            "prediction_previous_observation_id": (
+                previous_observation
+            ),
+
+            "prediction_status": prediction_status,
+
+            "prediction_probability_change": (
+                float(probability_change)
+                if probability_change is not None
+                else None
+            ),
+
+            "prediction_probability_change_abs": (
+                float(abs(probability_change))
+                if probability_change is not None
+                else None
+            ),
+
+            "prediction_previous_probability": (
+                float(previous_probability)
+                if previous_probability is not None
+                else None
+            ),
+
+            "prediction_state_key": engine_key,
 
             "probability_up": float(
                 probability_up
