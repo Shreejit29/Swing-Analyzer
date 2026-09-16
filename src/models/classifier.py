@@ -22,6 +22,7 @@ The public SwingClassifier name is retained for compatibility.
 from __future__ import annotations
 
 from typing import Optional
+import hashlib
 
 import numpy as np
 import pandas as pd
@@ -72,6 +73,7 @@ class EnsembleSwingClassifier:
         min_samples: int = 120,
         n_splits: int = 5,
         min_train_size: int = 60,
+        max_training_rows: Optional[int] = 1200,
     ):
         self.horizon = int(horizon)
         self.probability_threshold = float(probability_threshold)
@@ -79,6 +81,11 @@ class EnsembleSwingClassifier:
         self.min_samples = int(min_samples)
         self.n_splits = int(n_splits)
         self.min_train_size = int(min_train_size)
+        self.max_training_rows = (
+            int(max_training_rows) if max_training_rows is not None else None
+        )
+        if self.max_training_rows is not None and self.max_training_rows < self.min_samples:
+            raise ValueError("max_training_rows must be >= min_samples.")
 
         self.models = {}
         self.model = None
@@ -86,6 +93,11 @@ class EnsembleSwingClassifier:
         self.feature_names_: list[str] = []
         self.trained_rows = 0
         self.class_balance = {}
+        self.training_start_ = None
+        self.training_end_ = None
+        self.training_window_ = 0
+        self.training_data_fingerprint_ = None
+        self.model_fingerprint_ = None
 
         self.component_names: list[str] = []
         self.component_weights = {}
@@ -424,6 +436,22 @@ class EnsembleSwingClassifier:
                 "Try a longer historical period."
             )
 
+        # Keep the training sample stable across repeated live refreshes.
+        # The latest rows are retained, while the full feature frame remains
+        # available to the caller for the final prediction.
+        if (
+            self.max_training_rows is not None
+            and len(x) > self.max_training_rows
+        ):
+            x = x.iloc[-self.max_training_rows:].copy()
+            y = y.loc[x.index].copy()
+
+        # Enforce chronological order before validation/training.
+        if not x.index.is_monotonic_increasing:
+            order = np.argsort(np.asarray(x.index))
+            x = x.iloc[order].copy()
+            y = y.iloc[order].copy()
+
         self.feature_columns = list(x.columns)
 
         # Backward-compatible attribute expected by the predictor/UI.
@@ -432,6 +460,34 @@ class EnsembleSwingClassifier:
         self.feature_names_ = list(self.feature_columns)
 
         self.trained_rows = len(x)
+        self.training_window_ = len(x)
+        if len(x):
+            self.training_start_ = str(x.index[0])
+            self.training_end_ = str(x.index[-1])
+
+        # Fingerprint the exact labelled training snapshot and configuration.
+        # This makes it possible to diagnose why a refreshed model changed.
+        try:
+            row_hash = pd.util.hash_pandas_object(
+                pd.concat([x, y.rename("__target__")], axis=1),
+                index=True,
+            ).values.tobytes()
+            config = repr((
+                self.horizon,
+                self.random_state,
+                self.min_samples,
+                self.n_splits,
+                self.min_train_size,
+                self.max_training_rows,
+                tuple(self.feature_columns),
+            )).encode("utf-8")
+            self.training_data_fingerprint_ = hashlib.sha256(row_hash).hexdigest()[:16]
+            self.model_fingerprint_ = hashlib.sha256(
+                config + self.training_data_fingerprint_.encode("utf-8")
+            ).hexdigest()[:16]
+        except Exception:
+            self.training_data_fingerprint_ = None
+            self.model_fingerprint_ = None
 
         counts = y.value_counts().to_dict()
         self.class_balance = {
@@ -579,67 +635,10 @@ class EnsembleSwingClassifier:
             except Exception:
                 component_auc = np.nan
 
-            # Full out-of-fold component diagnostics. These metrics are
-            # calculated only on observations that were not used to fit the
-            # corresponding fold model.
-            component_pred = (prob >= 0.50).astype(int)
-
-            try:
-                component_accuracy = float(
-                    accuracy_score(actual, component_pred)
-                )
-            except Exception:
-                component_accuracy = np.nan
-
-            try:
-                component_precision = float(
-                    precision_score(
-                        actual,
-                        component_pred,
-                        zero_division=0,
-                    )
-                )
-            except Exception:
-                component_precision = np.nan
-
-            try:
-                component_recall = float(
-                    recall_score(
-                        actual,
-                        component_pred,
-                        zero_division=0,
-                    )
-                )
-            except Exception:
-                component_recall = np.nan
-
-            try:
-                component_f1 = float(
-                    f1_score(
-                        actual,
-                        component_pred,
-                        zero_division=0,
-                    )
-                )
-            except Exception:
-                component_f1 = np.nan
-
-            try:
-                component_brier = float(
-                    brier_score_loss(actual, prob)
-                )
-            except Exception:
-                component_brier = np.nan
-
             metrics[name] = {
                 "oof_samples": int(mask.sum()),
-                "accuracy": component_accuracy,
-                "precision": component_precision,
-                "recall": component_recall,
-                "f1": component_f1,
-                "roc_auc": component_auc,
-                "brier": component_brier,
                 "log_loss": component_logloss,
+                "roc_auc": component_auc,
             }
 
         self.component_validation_metrics_ = metrics
@@ -1200,6 +1199,16 @@ class EnsembleSwingClassifier:
             "trained_rows": int(
                 self.trained_rows
             ),
+            "max_training_rows": (
+                int(self.max_training_rows)
+                if self.max_training_rows is not None
+                else None
+            ),
+            "training_window_rows": int(self.training_window_),
+            "training_start": self.training_start_,
+            "training_end": self.training_end_,
+            "training_data_fingerprint": self.training_data_fingerprint_,
+            "model_fingerprint": self.model_fingerprint_,
             "feature_count": int(
                 len(self.feature_columns)
             ),
