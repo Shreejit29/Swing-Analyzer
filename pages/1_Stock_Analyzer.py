@@ -254,6 +254,255 @@ uncertainty = float(
 )
 
 
+
+# =====================================================================
+# SIMPLE INVESTOR SUMMARY HELPERS
+# =====================================================================
+
+def _safe_num(value, default=0.0):
+    try:
+        value = float(value)
+        return value if np.isfinite(value) else default
+    except Exception:
+        return default
+
+
+def _plain_direction(signal_value):
+    signal_value = str(signal_value).upper()
+    if signal_value == "BUY":
+        return "The model sees more evidence for an upward move."
+    if signal_value == "SELL":
+        return "The model sees more evidence for a downward move."
+    return "The model does not see enough evidence in either direction."
+
+
+def _plain_support(label, score=0.0):
+    text = str(label).upper()
+    if "STRONG BULL" in text or "BULLISH" in text or text == "BULL":
+        return "Supportive"
+    if "STRONG BEAR" in text or "BEARISH" in text or text == "BEAR":
+        return "Not supportive"
+    if "SIDEWAYS" in text or "NEUTRAL" in text:
+        return "Mixed / neutral"
+
+    score = _safe_num(score)
+    if score > 0.20:
+        return "Supportive"
+    if score < -0.20:
+        return "Not supportive"
+    return "Mixed / neutral"
+
+
+def _plain_trend(value):
+    return str(value).replace("_", " ").title()
+
+
+# =====================================================================
+# SIMPLE INVESTOR SUMMARY
+# =====================================================================
+
+market_context = result.get("market_context", {})
+sector_context = result.get("sector_context", {})
+agreement_data = result.get("model_agreement", {})
+
+agreement_simple = _safe_num(agreement_data.get("agreement", 0.0))
+bullish_simple = int(agreement_data.get("bullish_models", 0))
+bearish_simple = int(agreement_data.get("bearish_models", 0))
+total_simple = int(agreement_data.get("total_models", 0))
+
+weekly_simple = result.get("weekly_trend", "UNKNOWN")
+monthly_simple = result.get("monthly_trend", "UNKNOWN")
+alignment_simple = result.get("three_timeframe_alignment", "UNKNOWN")
+regime_simple = result.get("regime", "UNKNOWN")
+
+market_trend_simple = (
+    market_context.get("trend", "UNKNOWN")
+    if isinstance(market_context, dict)
+    else "UNKNOWN"
+)
+market_score_simple = (
+    market_context.get("score", 0.0)
+    if isinstance(market_context, dict)
+    else 0.0
+)
+
+sector_label_simple = (
+    sector_context.get("summary", "UNKNOWN")
+    if isinstance(sector_context, dict)
+    else "UNKNOWN"
+)
+sector_score_simple = (
+    sector_context.get("score", 0.0)
+    if isinstance(sector_context, dict)
+    else 0.0
+)
+
+if total_simple > 0:
+    if probability_up >= probability_down:
+        model_agreement_text = (
+            f"{bullish_simple}/{total_simple} models support an upward move"
+        )
+    else:
+        model_agreement_text = (
+            f"{bearish_simple}/{total_simple} models support a downward move"
+        )
+else:
+    model_agreement_text = "Model agreement data is not available"
+
+sentiment_words_simple = str(sentiment_label).upper()
+if "POSITIVE" in sentiment_words_simple or "BULL" in sentiment_words_simple:
+    news_text_simple = "News is generally positive"
+elif "NEGATIVE" in sentiment_words_simple or "BEAR" in sentiment_words_simple:
+    news_text_simple = "News is generally negative"
+elif sentiment_articles > 0:
+    news_text_simple = "News is mixed / neutral"
+else:
+    news_text_simple = "There is not enough news data"
+
+current_gate_confidence = max(
+    probability_up,
+    probability_down,
+)
+
+st.subheader("🧠 Simple Investor Summary")
+
+if signal == "BUY":
+    st.success(
+        f"### {ticker} — BUY\n\n"
+        f"{_plain_direction(signal)}"
+    )
+elif signal == "SELL":
+    st.error(
+        f"### {ticker} — SELL\n\n"
+        f"{_plain_direction(signal)}"
+    )
+else:
+    st.warning(
+        f"### {ticker} — WAIT\n\n"
+        f"{_plain_direction(signal)}"
+    )
+
+st.caption(
+    "This is a plain-language explanation of the model output. "
+    "It is not a guarantee of future price movement."
+)
+
+q1, q2, q3, q4 = st.columns(4)
+
+with q1:
+    st.metric("AI Confidence", f"{confidence:.1%}")
+
+with q2:
+    st.metric(
+        "Model Agreement",
+        f"{agreement_simple:.0%}" if total_simple else "N/A",
+    )
+
+with q3:
+    st.metric("Price Trend", _plain_trend(weekly_simple))
+
+with q4:
+    st.metric(
+        "90% Check",
+        "REACHED" if current_gate_confidence >= 0.90 else "NOT REACHED",
+    )
+
+st.markdown("#### Why is the model saying this?")
+
+reason_col1, reason_col2 = st.columns(2)
+
+with reason_col1:
+    st.write(f"• **AI models:** {model_agreement_text}")
+    st.write(f"• **Weekly trend:** {_plain_trend(weekly_simple)}")
+    st.write(f"• **Monthly trend:** {_plain_trend(monthly_simple)}")
+    st.write(
+        f"• **Market environment:** "
+        f"{_plain_support(market_trend_simple, market_score_simple)}"
+    )
+
+with reason_col2:
+    st.write(
+        f"• **Sector environment:** "
+        f"{_plain_support(sector_label_simple, sector_score_simple)}"
+    )
+    st.write(
+        f"• **News:** {news_text_simple} "
+        f"({sentiment_articles} article(s))"
+    )
+    st.write(
+        f"• **Timeframe agreement:** {_plain_trend(alignment_simple)}"
+    )
+    st.write(
+        f"• **Market regime:** {_plain_trend(regime_simple)}"
+    )
+
+if current_gate_confidence >= 0.90:
+    st.success(
+        f"**90% confidence check:** reached at "
+        f"**{current_gate_confidence:.1%}**. "
+        "The detailed reliability section below shows how this "
+        "confidence range performed in historical validation."
+    )
+elif current_gate_confidence >= 0.80:
+    st.warning(
+        f"**90% confidence check:** not reached. "
+        f"Current model confidence is **{current_gate_confidence:.1%}**."
+    )
+else:
+    st.info(
+        f"**90% confidence check:** not reached. "
+        f"Current model confidence is **{current_gate_confidence:.1%}**."
+    )
+
+if base_signal != signal:
+    st.caption(
+        f"The initial ensemble signal was **{base_signal}**, "
+        f"but additional evidence/risk filters produced the final "
+        f"signal **{signal}**."
+    )
+
+simple_plan = result.get("trade_plan", {})
+
+if signal in {"BUY", "SELL"} and isinstance(simple_plan, dict):
+    entry_simple = simple_plan.get("entry")
+    stop_simple = simple_plan.get("stop_loss")
+    target_simple = simple_plan.get("target")
+
+    if any(
+        value is not None
+        for value in [entry_simple, stop_simple, target_simple]
+    ):
+        st.markdown("#### Risk levels shown by the model")
+
+        rp1, rp2, rp3 = st.columns(3)
+
+        with rp1:
+            st.metric(
+                "Entry",
+                f"₹{float(entry_simple):,.2f}"
+                if entry_simple is not None
+                else "—",
+            )
+
+        with rp2:
+            st.metric(
+                "Stop Loss",
+                f"₹{float(stop_simple):,.2f}"
+                if stop_simple is not None
+                else "—",
+            )
+
+        with rp3:
+            st.metric(
+                "Target",
+                f"₹{float(target_simple):,.2f}"
+                if target_simple is not None
+                else "—",
+            )
+
+st.divider()
+
+
 # =====================================================================
 # SIGNAL HEADER
 # =====================================================================
