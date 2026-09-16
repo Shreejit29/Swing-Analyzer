@@ -349,12 +349,28 @@ if total_simple > 0:
 else:
     model_agreement_text = "Model agreement data is not available"
 
-sentiment_words_simple = str(sentiment_label).upper()
+sentiment_data_simple = result.get("sentiment", {})
+if isinstance(sentiment_data_simple, dict):
+    sentiment_label_simple = sentiment_data_simple.get(
+        "label", sentiment_data_simple.get("sentiment", "UNKNOWN")
+    )
+    sentiment_articles_simple = int(
+        _safe_num(
+            sentiment_data_simple.get(
+                "articles", sentiment_data_simple.get("article_count", 0)
+            )
+        )
+    )
+else:
+    sentiment_label_simple = "UNKNOWN"
+    sentiment_articles_simple = 0
+
+sentiment_words_simple = str(sentiment_label_simple).upper()
 if "POSITIVE" in sentiment_words_simple or "BULL" in sentiment_words_simple:
     news_text_simple = "News is generally positive"
 elif "NEGATIVE" in sentiment_words_simple or "BEAR" in sentiment_words_simple:
     news_text_simple = "News is generally negative"
-elif sentiment_articles > 0:
+elif sentiment_articles_simple > 0:
     news_text_simple = "News is mixed / neutral"
 else:
     news_text_simple = "There is not enough news data"
@@ -427,7 +443,7 @@ with reason_col2:
     )
     st.write(
         f"• **News:** {news_text_simple} "
-        f"({sentiment_articles} article(s))"
+        f"({sentiment_articles_simple} article(s))"
     )
     st.write(
         f"• **Timeframe agreement:** {_plain_trend(alignment_simple)}"
