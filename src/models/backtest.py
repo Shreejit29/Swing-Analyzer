@@ -1,14 +1,29 @@
 """
-Walk-forward backtesting engine.
+Walk-Forward Swing Trading Backtester
 
-Uses the same feature pipeline and Gradient Boosting classifier
-as the Stock Analyzer.
+Designed for realistic chronological evaluation.
+
+Key principles:
+- No random train/test split
+- No future information in model training
+- Signal generated at the decision close
+- Entry occurs at the following trading day's open
+- Stop-loss / target / time-based exits
+- Transaction costs and slippage
+- Walk-forward model retraining
+- Ensemble probability
+- Model agreement
+- Performance diagnostics
+
+Historical news sentiment is intentionally NOT fetched here.
+Using today's news for historical trades would create look-ahead bias.
+Time-aligned historical sentiment can be added later.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -17,152 +32,109 @@ from src.features.engine import build_features
 from src.models.classifier import SwingClassifier
 
 
+# =====================================================================
+# CONFIGURATION
+# =====================================================================
+
+
 @dataclass
 class BacktestConfig:
     initial_capital: float = 100000.0
+
     horizon: int = 5
 
     probability_threshold: float = 0.60
 
     stop_loss_pct: float = 0.03
+
     target_pct: float = 0.06
 
     risk_per_trade: float = 0.01
 
     transaction_cost: float = 0.001
+
     slippage: float = 0.0005
 
     retrain_every: int = 20
+
     min_train_rows: int = 180
 
-    def validate(self) -> None:
-        if self.initial_capital <= 0:
-            raise ValueError(
-                "initial_capital must be greater than zero."
-            )
+    # Require minimum model agreement before entering.
+    min_model_agreement: float = 0.60
 
-        if self.horizon < 1:
-            raise ValueError(
-                "horizon must be at least 1."
-            )
-
-        if not 0.5 <= self.probability_threshold <= 1:
-            raise ValueError(
-                "probability_threshold must be between 0.5 and 1."
-            )
-
-        if self.stop_loss_pct <= 0:
-            raise ValueError(
-                "stop_loss_pct must be greater than zero."
-            )
-
-        if self.target_pct <= 0:
-            raise ValueError(
-                "target_pct must be greater than zero."
-            )
-
-        if not 0 < self.risk_per_trade <= 1:
-            raise ValueError(
-                "risk_per_trade must be between 0 and 1."
-            )
-
-        if self.transaction_cost < 0:
-            raise ValueError(
-                "transaction_cost cannot be negative."
-            )
-
-        if self.slippage < 0:
-            raise ValueError(
-                "slippage cannot be negative."
-            )
-
-        if self.retrain_every < 1:
-            raise ValueError(
-                "retrain_every must be at least 1."
-            )
-
-        if self.min_train_rows < 30:
-            raise ValueError(
-                "min_train_rows must be at least 30."
-            )
+    # Maximum number of simultaneous positions.
+    max_positions: int = 1
 
 
-def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalize OHLCV column names to lowercase.
-    """
+# =====================================================================
+# HELPERS
+# =====================================================================
 
-    if not isinstance(df, pd.DataFrame):
-        raise TypeError(
-            "df must be a pandas DataFrame."
-        )
 
-    out = df.copy()
+def _safe_float(
+    value: Any,
+    default: float = 0.0,
+) -> float:
 
-    # Flatten MultiIndex columns.
-    if isinstance(out.columns, pd.MultiIndex):
-        flattened = []
+    try:
 
-        for col in out.columns:
-            parts = [
-                str(x).strip()
+        result = float(value)
+
+        if np.isfinite(result):
+            return result
+
+    except Exception:
+        pass
+
+    return float(default)
+
+
+def _normalize_ohlcv(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Normalize OHLCV columns."""
+
+    data = df.copy()
+
+    if isinstance(
+        data.columns,
+        pd.MultiIndex,
+    ):
+
+        data.columns = [
+            "_".join(
+                str(x)
                 for x in col
-                if str(x).strip()
-            ]
+                if str(x).lower() != "nan"
+            ).strip("_")
+            for col in data.columns
+        ]
 
-            flattened.append(
-                "_".join(parts)
-            )
+    data.columns = [
+        str(c).strip().lower()
+        for c in data.columns
+    ]
 
-        out.columns = flattened
-
+    # Common Yahoo Finance naming variants.
     rename_map = {}
 
-    for column in out.columns:
+    for column in data.columns:
 
-        clean = str(column).strip().lower()
+        clean = column.replace(
+            " ",
+            "_",
+        )
 
         if clean in {
-            "open",
-            "open_price",
-        }:
-            rename_map[column] = "open"
-
-        elif clean in {
-            "high",
-            "high_price",
-        }:
-            rename_map[column] = "high"
-
-        elif clean in {
-            "low",
-            "low_price",
-        }:
-            rename_map[column] = "low"
-
-        elif clean in {
-            "close",
-            "close_price",
-            "adj close",
             "adj_close",
+            "adjusted_close",
         }:
+
             rename_map[column] = "close"
 
-        elif clean in {
-            "volume",
-            "vol",
-        }:
-            rename_map[column] = "volume"
-
-    out = out.rename(
+    data = data.rename(
         columns=rename_map
     )
-
-    # Remove duplicate columns.
-    out = out.loc[
-        :,
-        ~out.columns.duplicated()
-    ]
 
     required = [
         "open",
@@ -173,9 +145,9 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     ]
 
     missing = [
-        col
-        for col in required
-        if col not in out.columns
+        c
+        for c in required
+        if c not in data.columns
     ]
 
     if missing:
@@ -184,346 +156,704 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
             + ", ".join(missing)
         )
 
-    for col in required:
-        out[col] = pd.to_numeric(
-            out[col],
+    for column in required:
+
+        data[column] = pd.to_numeric(
+            data[column],
             errors="coerce",
         )
 
-    out = out.dropna(
+    data = data.replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+
+    data = data.dropna(
         subset=required
     )
 
-    return out
+    data = data.sort_index()
 
+    # Remove duplicate timestamps.
+    data = data[
+        ~data.index.duplicated(
+            keep="last"
+        )
+    ]
 
-def _extract_probability(
-    prediction: Any,
-) -> float:
-    """
-    Convert classifier probability output into
-    a single probability for the bullish class.
-    """
-
-    if prediction is None:
-        return 0.5
-
-    if np.isscalar(prediction):
-        try:
-            value = float(prediction)
-
-            if 0 <= value <= 1:
-                return value
-
-        except Exception:
-            return 0.5
-
-    try:
-        array = np.asarray(
-            prediction,
-            dtype=float,
+    if data.empty:
+        raise ValueError(
+            "No valid OHLCV data remains."
         )
 
-        if array.ndim == 0:
-            value = float(array)
-
-        elif array.ndim == 1:
-            if len(array) == 0:
-                return 0.5
-
-            if len(array) == 1:
-                value = float(array[0])
-
-            else:
-                value = float(array[-1])
-
-        else:
-            row = array[-1]
-
-            if len(row) == 1:
-                value = float(row[0])
-
-            else:
-                value = float(row[1])
-
-        return float(
-            np.clip(
-                value,
-                0.0,
-                1.0,
-            )
-        )
-
-    except Exception:
-        return 0.5
+    return data
 
 
-def _calculate_trade_result(
-    data: pd.DataFrame,
-    entry_index: int,
-    entry_price: float,
-    horizon: int,
-    stop_loss_pct: float,
-    target_pct: float,
-) -> Dict[str, Any]:
-    """
-    Simulate a long trade after entry.
+def _calculate_equity_metrics(
+    equity_curve: pd.Series,
+    initial_capital: float,
+) -> Dict[str, float]:
 
-    Entry is assumed to occur at the next available open.
-    """
-
-    last_index = min(
-        entry_index + horizon,
-        len(data) - 1,
-    )
-
-    stop_price = (
-        entry_price
-        * (1.0 - stop_loss_pct)
-    )
-
-    target_price = (
-        entry_price
-        * (1.0 + target_pct)
-    )
-
-    exit_index = last_index
-    exit_price = float(
-        data["close"].iloc[last_index]
-    )
-
-    exit_reason = "HORIZON"
-
-    for i in range(
-        entry_index,
-        last_index + 1,
+    if (
+        equity_curve is None
+        or equity_curve.empty
     ):
 
+        return {
+            "total_return": 0.0,
+            "cagr": 0.0,
+            "max_drawdown": 0.0,
+            "max_drawdown_pct": 0.0,
+            "volatility": 0.0,
+            "sharpe": 0.0,
+        }
+
+    equity = pd.to_numeric(
+        equity_curve,
+        errors="coerce",
+    ).dropna()
+
+    if equity.empty:
+        return {
+            "total_return": 0.0,
+            "cagr": 0.0,
+            "max_drawdown": 0.0,
+            "max_drawdown_pct": 0.0,
+            "volatility": 0.0,
+            "sharpe": 0.0,
+        }
+
+    final_equity = float(
+        equity.iloc[-1]
+    )
+
+    total_return = (
+        final_equity
+        / initial_capital
+        - 1.0
+    )
+
+    running_max = equity.cummax()
+
+    drawdown = (
+        equity
+        / running_max
+        - 1.0
+    )
+
+    max_drawdown_pct = float(
+        drawdown.min()
+    )
+
+    max_drawdown = float(
+        initial_capital
+        * abs(max_drawdown_pct)
+    )
+
+    returns = equity.pct_change().dropna()
+
+    if len(returns) >= 2:
+
+        volatility = float(
+            returns.std()
+            * np.sqrt(252)
+        )
+
+        mean_return = float(
+            returns.mean()
+        )
+
+        std_return = float(
+            returns.std()
+        )
+
+        if std_return > 0:
+
+            sharpe = float(
+                mean_return
+                / std_return
+                * np.sqrt(252)
+            )
+
+        else:
+            sharpe = 0.0
+
+    else:
+
+        volatility = 0.0
+        sharpe = 0.0
+
+    # ---------------------------------------------------------------
+    # CAGR
+    # ---------------------------------------------------------------
+
+    try:
+
+        days = (
+            equity.index[-1]
+            - equity.index[0]
+        ).days
+
+        years = (
+            days / 365.25
+        )
+
+        if (
+            years > 0
+            and final_equity > 0
+        ):
+
+            cagr = float(
+                (
+                    final_equity
+                    / initial_capital
+                )
+                ** (1.0 / years)
+                - 1.0
+            )
+
+        else:
+            cagr = 0.0
+
+    except Exception:
+
+        cagr = 0.0
+
+    return {
+        "total_return": float(
+            total_return
+        ),
+        "cagr": float(cagr),
+        "max_drawdown": float(
+            max_drawdown
+        ),
+        "max_drawdown_pct": float(
+            max_drawdown_pct
+        ),
+        "volatility": float(
+            volatility
+        ),
+        "sharpe": float(
+            sharpe
+        ),
+    }
+
+
+# =====================================================================
+# EXIT LOGIC
+# =====================================================================
+
+
+def _simulate_exit(
+    data: pd.DataFrame,
+    entry_position: int,
+    entry_price: float,
+    signal: str,
+    stop_loss_pct: float,
+    target_pct: float,
+    horizon: int,
+) -> Dict[str, Any]:
+
+    last_index = len(data) - 1
+
+    max_exit_position = min(
+        entry_position + horizon,
+        last_index,
+    )
+
+    for position in range(
+        entry_position,
+        max_exit_position + 1,
+    ):
+
+        row = data.iloc[position]
+
         high = float(
-            data["high"].iloc[i]
+            row["high"]
         )
 
         low = float(
-            data["low"].iloc[i]
+            row["low"]
         )
 
-        # Conservative assumption:
-        # if both levels are touched on the
-        # same candle, stop loss is assumed first.
-        if low <= stop_price:
+        close = float(
+            row["close"]
+        )
 
-            exit_index = i
-            exit_price = stop_price
-            exit_reason = "STOP_LOSS"
-            break
+        # -----------------------------------------------------------
+        # LONG
+        # -----------------------------------------------------------
 
-        if high >= target_price:
+        if signal == "BUY":
 
-            exit_index = i
-            exit_price = target_price
-            exit_reason = "TARGET"
-            break
+            stop_price = (
+                entry_price
+                * (1.0 - stop_loss_pct)
+            )
+
+            target_price = (
+                entry_price
+                * (1.0 + target_pct)
+            )
+
+            # Conservative assumption:
+            # if both levels are hit on the same candle,
+            # assume the stop was hit first.
+            if low <= stop_price:
+
+                return {
+                    "exit_position": position,
+                    "exit_price": stop_price,
+                    "exit_reason": "STOP LOSS",
+                }
+
+            if high >= target_price:
+
+                return {
+                    "exit_position": position,
+                    "exit_price": target_price,
+                    "exit_reason": "TARGET",
+                }
+
+        # -----------------------------------------------------------
+        # SHORT
+        # -----------------------------------------------------------
+
+        elif signal == "SELL":
+
+            stop_price = (
+                entry_price
+                * (1.0 + stop_loss_pct)
+            )
+
+            target_price = (
+                entry_price
+                * (1.0 - target_pct)
+            )
+
+            if high >= stop_price:
+
+                return {
+                    "exit_position": position,
+                    "exit_price": stop_price,
+                    "exit_reason": "STOP LOSS",
+                }
+
+            if low <= target_price:
+
+                return {
+                    "exit_position": position,
+                    "exit_price": target_price,
+                    "exit_reason": "TARGET",
+                }
+
+    # ---------------------------------------------------------------
+    # HORIZON / LAST AVAILABLE CLOSE
+    # ---------------------------------------------------------------
+
+    exit_position = max_exit_position
+
+    exit_price = float(
+        data.iloc[
+            exit_position
+        ]["close"]
+    )
+
+    if exit_position >= last_index:
+        reason = "END OF DATA"
+    else:
+        reason = "HORIZON"
 
     return {
-        "exit_index": exit_index,
+        "exit_position": exit_position,
         "exit_price": exit_price,
-        "exit_reason": exit_reason,
+        "exit_reason": reason,
     }
+
+
+# =====================================================================
+# TRADE PNL
+# =====================================================================
+
+
+def _calculate_trade_pnl(
+    signal: str,
+    entry_price: float,
+    exit_price: float,
+    transaction_cost: float,
+    slippage: float,
+) -> Dict[str, float]:
+
+    entry_price = float(
+        entry_price
+    )
+
+    exit_price = float(
+        exit_price
+    )
+
+    # Slippage works against the position.
+    if signal == "BUY":
+
+        effective_entry = (
+            entry_price
+            * (1.0 + slippage)
+        )
+
+        effective_exit = (
+            exit_price
+            * (1.0 - slippage)
+        )
+
+        gross_return = (
+            effective_exit
+            / effective_entry
+            - 1.0
+        )
+
+    else:
+
+        effective_entry = (
+            entry_price
+            * (1.0 - slippage)
+        )
+
+        effective_exit = (
+            exit_price
+            * (1.0 + slippage)
+        )
+
+        gross_return = (
+            effective_entry
+            / effective_exit
+            - 1.0
+        )
+
+    # Approximate round-trip transaction cost.
+    net_return = (
+        gross_return
+        - 2.0 * transaction_cost
+    )
+
+    return {
+        "gross_return": float(
+            gross_return
+        ),
+        "net_return": float(
+            net_return
+        ),
+    }
+
+
+# =====================================================================
+# WALK-FORWARD BACKTEST
+# =====================================================================
 
 
 def run_backtest(
     df: pd.DataFrame,
-    config: BacktestConfig | None = None,
+    config: Optional[
+        BacktestConfig
+    ] = None,
 ) -> Dict[str, Any]:
     """
-    Run a walk-forward long-only backtest.
+    Execute a walk-forward backtest.
 
-    The model is retrained periodically using only data
-    available before the prediction point.
+    Signal date:
+        close of day t
+
+    Entry:
+        open of day t+1
+
+    Training:
+        only information available before the signal.
+
+    This is deliberately conservative.
     """
 
     if config is None:
         config = BacktestConfig()
 
-    config.validate()
+    data = _normalize_ohlcv(
+        df
+    )
 
-    data = _normalize_ohlcv(df)
+    if len(data) < (
+        config.min_train_rows
+        + config.horizon
+        + 10
+    ):
 
-    if len(data) < config.min_train_rows + config.horizon + 10:
         raise ValueError(
-            f"Not enough data for backtesting. "
-            f"Need at least "
-            f"{config.min_train_rows + config.horizon + 10} "
-            f"rows, received {len(data)}."
+            "Not enough historical data for "
+            "walk-forward backtesting."
         )
 
-    # ---------------------------------------------------------
-    # Build the exact same feature pipeline used by the model.
-    # ---------------------------------------------------------
+    # ================================================================
+    # FEATURE ENGINEERING
+    # ================================================================
 
     features = build_features(
         data
     )
 
-    features = features.replace(
-        [np.inf, -np.inf],
-        np.nan,
-    )
+    if features is None or features.empty:
 
-    # Target:
-    # future return after the requested horizon.
-    features["future_return"] = (
-        features["close"]
-        .shift(-config.horizon)
-        / features["close"]
-        - 1.0
-    )
-
-    features["target"] = (
-        features["future_return"] > 0
-    ).astype(int)
-
-    feature_rows = features.dropna(
-        subset=["future_return"]
-    ).copy()
-
-    if len(feature_rows) < config.min_train_rows:
         raise ValueError(
-            "Insufficient usable rows after feature construction."
+            "Feature engineering returned no data."
         )
+
+    # Align data/features.
+    common_index = (
+        data.index.intersection(
+            features.index
+        )
+    )
+
+    data = data.loc[
+        common_index
+    ].copy()
+
+    features = features.loc[
+        common_index
+    ].copy()
+
+    data = data.sort_index()
+    features = features.sort_index()
+
+    # ================================================================
+    # PORTFOLIO STATE
+    # ================================================================
 
     capital = float(
         config.initial_capital
     )
 
-    equity = []
-    trades: List[Dict[str, Any]] = []
+    equity_values = []
+    equity_dates = []
 
-    model = None
-    last_training_index = -config.retrain_every
+    trades = []
 
-    # ---------------------------------------------------------
-    # Walk forward.
-    # ---------------------------------------------------------
+    last_retrain_position = -10**9
 
-    start_index = config.min_train_rows
+    cached_model = None
 
-    i = start_index
+    cached_model_position = -1
 
-    while i < len(feature_rows) - 1:
+    position_open_until = -1
 
-        # -----------------------------------------------------
-        # Retrain model periodically.
-        # -----------------------------------------------------
+    # ================================================================
+    # WALK FORWARD
+    # ================================================================
+
+    start_position = (
+        config.min_train_rows
+    )
+
+    for signal_position in range(
+        start_position,
+        len(data) - 1,
+    ):
+
+        # ------------------------------------------------------------
+        # Mark current equity.
+        # ------------------------------------------------------------
+
+        equity_values.append(
+            capital
+        )
+
+        equity_dates.append(
+            data.index[
+                signal_position
+            ]
+        )
+
+        # ------------------------------------------------------------
+        # Skip if another trade is still active.
+        # ------------------------------------------------------------
 
         if (
-            model is None
-            or i - last_training_index
-            >= config.retrain_every
+            signal_position
+            <= position_open_until
+        ):
+            continue
+
+        # ------------------------------------------------------------
+        # Retrain periodically.
+        # ------------------------------------------------------------
+
+        if (
+            cached_model is None
+            or (
+                signal_position
+                - last_retrain_position
+                >= config.retrain_every
+            )
         ):
 
-            training_data = feature_rows.iloc[
-                :i
+            # IMPORTANT:
+            # Training data ends at the signal date.
+            #
+            # The classifier's future target automatically removes
+            # the last `horizon` observations because their future
+            # outcome is not yet known.
+            train_features = features.iloc[
+                : signal_position + 1
             ].copy()
 
-            if len(training_data) < config.min_train_rows:
-                i += 1
-                continue
-
-            model = SwingClassifier(
-                horizon=config.horizon,
-                probability_threshold=(
-                    config.probability_threshold
-                ),
-                random_state=42,
-                min_samples=config.min_train_rows,
-            )
-
             try:
-                model.fit(
-                    training_data
+
+                model = SwingClassifier(
+                    horizon=config.horizon,
+                    probability_threshold=(
+                        config.probability_threshold
+                    ),
+                    min_samples=(
+                        min(
+                            config.min_train_rows,
+                            80,
+                        )
+                    ),
                 )
 
-                last_training_index = i
+                model.fit(
+                    train_features
+                )
+
+                cached_model = model
+
+                last_retrain_position = (
+                    signal_position
+                )
+
+                cached_model_position = (
+                    signal_position
+                )
 
             except Exception:
-                model = None
-                i += 1
                 continue
 
-        # -----------------------------------------------------
-        # Current row.
-        # -----------------------------------------------------
+        # ------------------------------------------------------------
+        # Generate signal using information available at t.
+        # ------------------------------------------------------------
 
-        current_row = feature_rows.iloc[
-            i:i + 1
+        if cached_model is None:
+            continue
+
+        current_features = features.iloc[
+            [signal_position]
         ].copy()
 
         try:
-            prediction = model.predict_proba(
-                current_row
-            )
 
-            probability = _extract_probability(
-                prediction
+            probability = float(
+                cached_model.predict_proba(
+                    current_features
+                )[0, 1]
             )
 
         except Exception:
-            probability = 0.5
-
-        # -----------------------------------------------------
-        # No trade.
-        # -----------------------------------------------------
-
-        if (
-            probability
-            < config.probability_threshold
-        ):
-
-            equity.append(
-                {
-                    "index": feature_rows.index[i],
-                    "equity": capital,
-                }
-            )
-
-            i += 1
             continue
 
-        # -----------------------------------------------------
-        # Enter on next day's open.
-        # -----------------------------------------------------
+        probability = float(
+            np.clip(
+                probability,
+                0.0,
+                1.0,
+            )
+        )
 
-        entry_index = i + 1
+        # ------------------------------------------------------------
+        # Model agreement.
+        # ------------------------------------------------------------
 
-        if entry_index >= len(feature_rows):
+        try:
+
+            agreement_info = (
+                cached_model.model_agreement(
+                    current_features
+                )
+            )
+
+            agreement = _safe_float(
+                agreement_info.get(
+                    "agreement",
+                    0.0,
+                ),
+                0.0,
+            )
+
+        except Exception:
+
+            agreement = 0.0
+
+        # ------------------------------------------------------------
+        # Signal.
+        # ------------------------------------------------------------
+
+        if probability >= (
+            config.probability_threshold
+        ):
+
+            signal = "BUY"
+
+        elif probability <= (
+            1.0
+            - config.probability_threshold
+        ):
+
+            signal = "SELL"
+
+        else:
+
+            signal = "WAIT"
+
+        # ------------------------------------------------------------
+        # Agreement filter.
+        # ------------------------------------------------------------
+
+        if (
+            signal != "WAIT"
+            and agreement
+            < config.min_model_agreement
+        ):
+
+            signal = "WAIT"
+
+        if signal == "WAIT":
+            continue
+
+        # ------------------------------------------------------------
+        # Entry next day.
+        # ------------------------------------------------------------
+
+        entry_position = (
+            signal_position + 1
+        )
+
+        if entry_position >= len(data):
             break
 
-        entry_date = feature_rows.index[
-            entry_index
+        entry_date = data.index[
+            entry_position
         ]
 
         entry_price = float(
-            feature_rows[
-                "open"
-            ].iloc[entry_index]
+            data.iloc[
+                entry_position
+            ]["open"]
         )
 
-        if not np.isfinite(entry_price) or entry_price <= 0:
-            i += 1
+        if not np.isfinite(
+            entry_price
+        ) or entry_price <= 0:
+
             continue
 
-        # Account for entry costs and slippage.
-        effective_entry = (
-            entry_price
-            * (1.0 + config.slippage)
-        )
-
-        # -----------------------------------------------------
+        # ------------------------------------------------------------
         # Position sizing.
-        #
-        # Risk amount / stop distance
-        # -----------------------------------------------------
+        # ------------------------------------------------------------
 
         risk_amount = (
             capital
@@ -531,252 +861,487 @@ def run_backtest(
         )
 
         stop_distance = (
-            effective_entry
+            entry_price
             * config.stop_loss_pct
         )
 
-        if stop_distance <= 0:
-            i += 1
+        if (
+            stop_distance <= 0
+            or not np.isfinite(
+                stop_distance
+            )
+        ):
+
             continue
 
-        shares = (
+        quantity = (
             risk_amount
             / stop_distance
         )
 
-        if shares <= 0:
-            i += 1
+        if (
+            quantity <= 0
+            or not np.isfinite(
+                quantity
+            )
+        ):
+
             continue
 
-        trade = _calculate_trade_result(
-            feature_rows,
-            entry_index,
-            effective_entry,
-            config.horizon,
-            config.stop_loss_pct,
-            config.target_pct,
+        # ------------------------------------------------------------
+        # Exit simulation.
+        # ------------------------------------------------------------
+
+        exit_info = _simulate_exit(
+            data=data,
+            entry_position=entry_position,
+            entry_price=entry_price,
+            signal=signal,
+            stop_loss_pct=(
+                config.stop_loss_pct
+            ),
+            target_pct=(
+                config.target_pct
+            ),
+            horizon=config.horizon,
+        )
+
+        exit_position = int(
+            exit_info[
+                "exit_position"
+            ]
         )
 
         exit_price = float(
-            trade["exit_price"]
+            exit_info[
+                "exit_price"
+            ]
         )
 
-        effective_exit = (
-            exit_price
-            * (1.0 - config.slippage)
-        )
+        exit_date = data.index[
+            exit_position
+        ]
 
-        gross_pnl = (
-            effective_exit
-            - effective_entry
-        ) * shares
-
-        transaction_cost = (
-            (
-                effective_entry
-                + effective_exit
-            )
-            * shares
-            * config.transaction_cost
-        )
-
-        net_pnl = (
-            gross_pnl
-            - transaction_cost
-        )
-
-        capital += net_pnl
-
-        trade_record = {
-            "entry_date": entry_date,
-            "exit_date": feature_rows.index[
-                trade["exit_index"]
-            ],
-            "entry_price": effective_entry,
-            "exit_price": effective_exit,
-            "shares": shares,
-            "probability": probability,
-            "pnl": net_pnl,
-            "return_pct": (
-                net_pnl
-                / (
-                    effective_entry
-                    * shares
-                )
-                * 100.0
-            ),
-            "exit_reason": trade[
+        exit_reason = str(
+            exit_info[
                 "exit_reason"
-            ],
-            "capital_after": capital,
-        }
+            ]
+        )
+
+        # ------------------------------------------------------------
+        # PNL.
+        # ------------------------------------------------------------
+
+        pnl_info = (
+            _calculate_trade_pnl(
+                signal=signal,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                transaction_cost=(
+                    config.transaction_cost
+                ),
+                slippage=(
+                    config.slippage
+                ),
+            )
+        )
+
+        net_return = float(
+            pnl_info[
+                "net_return"
+            ]
+        )
+
+        pnl = (
+            capital
+            * net_return
+        )
+
+        capital_before = capital
+
+        capital = max(
+            0.0,
+            capital + pnl,
+        )
+
+        # ------------------------------------------------------------
+        # Record trade.
+        # ------------------------------------------------------------
 
         trades.append(
-            trade_record
-        )
-
-        # Record equity.
-        equity.append(
             {
-                "index": feature_rows.index[
-                    trade["exit_index"]
+                "signal_date": data.index[
+                    signal_position
                 ],
-                "equity": capital,
+                "entry_date": entry_date,
+                "exit_date": exit_date,
+                "signal": signal,
+                "probability_up": probability,
+                "model_agreement": agreement,
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "quantity": quantity,
+                "gross_return": pnl_info[
+                    "gross_return"
+                ],
+                "net_return": net_return,
+                "pnl": pnl,
+                "capital_before": capital_before,
+                "capital_after": capital,
+                "exit_reason": exit_reason,
+                "model_retrained": (
+                    cached_model_position
+                    == signal_position
+                ),
             }
         )
 
-        # Move beyond the completed trade.
-        i = (
-            trade["exit_index"]
-            + 1
+        # ------------------------------------------------------------
+        # Prevent overlapping trades.
+        # ------------------------------------------------------------
+
+        position_open_until = (
+            exit_position
         )
 
-    # ---------------------------------------------------------
-    # Equity curve.
-    # ---------------------------------------------------------
+    # ================================================================
+    # FINAL EQUITY
+    # ================================================================
 
-    if equity:
+    if not equity_dates:
 
-        equity_df = pd.DataFrame(
-            equity
-        )
-
-        equity_df = (
-            equity_df
-            .drop_duplicates(
-                subset=["index"],
-                keep="last",
-            )
-            .set_index("index")
+        equity_curve = pd.Series(
+            [config.initial_capital],
+            index=[
+                data.index[0]
+            ],
+            name="equity",
         )
 
     else:
 
-        equity_df = pd.DataFrame(
-            {
-                "equity": [
-                    config.initial_capital
-                ]
-            }
+        equity_dates = list(
+            equity_dates
         )
 
-    # ---------------------------------------------------------
-    # Performance metrics.
-    # ---------------------------------------------------------
+        equity_values = list(
+            equity_values
+        )
 
-    final_capital = float(
-        capital
-    )
+        # Add final capital.
+        equity_dates.append(
+            data.index[-1]
+        )
 
-    total_return = (
-        final_capital
-        / config.initial_capital
-        - 1.0
-    )
+        equity_values.append(
+            capital
+        )
 
-    equity_values = equity_df[
-        "equity"
-    ].astype(float)
+        equity_curve = pd.Series(
+            equity_values,
+            index=equity_dates,
+            name="equity",
+        )
 
-    running_max = (
-        equity_values
-        .cummax()
-    )
+        equity_curve = (
+            equity_curve[
+                ~equity_curve.index.duplicated(
+                    keep="last"
+                )
+            ]
+            .sort_index()
+        )
 
-    drawdown = (
-        equity_values
-        / running_max
-        - 1.0
-    )
-
-    max_drawdown = (
-        float(drawdown.min())
-        if len(drawdown)
-        else 0.0
-    )
+    # ================================================================
+    # TRADE DATAFRAME
+    # ================================================================
 
     trades_df = pd.DataFrame(
         trades
     )
 
-    if not trades_df.empty:
+    # ================================================================
+    # METRICS
+    # ================================================================
 
-        wins = trades_df[
-            "pnl"
-        ] > 0
-
-        win_rate = float(
-            wins.mean()
+    equity_metrics = (
+        _calculate_equity_metrics(
+            equity_curve,
+            config.initial_capital,
         )
+    )
 
-        gross_profit = float(
-            trades_df.loc[
-                trades_df["pnl"] > 0,
-                "pnl",
-            ].sum()
-        )
-
-        gross_loss = float(
-            -trades_df.loc[
-                trades_df["pnl"] < 0,
-                "pnl",
-            ].sum()
-        )
-
-        if gross_loss > 0:
-            profit_factor = (
-                gross_profit
-                / gross_loss
-            )
-        else:
-            profit_factor = float(
-                "inf"
-            )
-
-        average_trade = float(
-            trades_df["pnl"].mean()
-        )
-
-    else:
+    if trades_df.empty:
 
         win_rate = 0.0
         profit_factor = 0.0
         average_trade = 0.0
+        best_trade = 0.0
+        worst_trade = 0.0
+        winning_trades = 0
+        losing_trades = 0
 
-    return {
-        "initial_capital": (
+    else:
+
+        trade_returns = pd.to_numeric(
+            trades_df[
+                "net_return"
+            ],
+            errors="coerce",
+        ).fillna(0.0)
+
+        winning = (
+            trade_returns > 0
+        )
+
+        losing = (
+            trade_returns < 0
+        )
+
+        winning_trades = int(
+            winning.sum()
+        )
+
+        losing_trades = int(
+            losing.sum()
+        )
+
+        win_rate = float(
+            winning.mean()
+        )
+
+        gross_profit = float(
+            trade_returns[
+                winning
+            ].sum()
+        )
+
+        gross_loss = abs(
+            float(
+                trade_returns[
+                    losing
+                ].sum()
+            )
+        )
+
+        if gross_loss > 0:
+
+            profit_factor = (
+                gross_profit
+                / gross_loss
+            )
+
+        elif gross_profit > 0:
+
+            profit_factor = float(
+                "inf"
+            )
+
+        else:
+
+            profit_factor = 0.0
+
+        average_trade = float(
+            trade_returns.mean()
+        )
+
+        best_trade = float(
+            trade_returns.max()
+        )
+
+        worst_trade = float(
+            trade_returns.min()
+        )
+
+    # ================================================================
+    # MODEL DIAGNOSTICS
+    # ================================================================
+
+    if trades_df.empty:
+
+        average_probability = 0.0
+        average_agreement = 0.0
+
+    else:
+
+        average_probability = float(
+            trades_df[
+                "probability_up"
+            ].mean()
+        )
+
+        average_agreement = float(
+            trades_df[
+                "model_agreement"
+            ].mean()
+        )
+
+    metrics = {
+        **equity_metrics,
+
+        "initial_capital": float(
             config.initial_capital
         ),
-        "final_capital": (
-            final_capital
+
+        "final_capital": float(
+            capital
         ),
-        "total_return": (
-            total_return
+
+        "total_trades": int(
+            len(trades_df)
         ),
-        "max_drawdown": (
-            max_drawdown
+
+        "winning_trades": int(
+            winning_trades
         ),
-        "trades": len(trades),
-        "win_rate": win_rate,
-        "profit_factor": profit_factor,
-        "average_trade": average_trade,
-        "equity_curve": equity_df,
-        "trades_df": trades_df,
+
+        "losing_trades": int(
+            losing_trades
+        ),
+
+        "win_rate": float(
+            win_rate
+        ),
+
+        "profit_factor": float(
+            profit_factor
+        ),
+
+        "average_trade": float(
+            average_trade
+        ),
+
+        "best_trade": float(
+            best_trade
+        ),
+
+        "worst_trade": float(
+            worst_trade
+        ),
+
+        "average_probability": float(
+            average_probability
+        ),
+
+        "average_model_agreement": float(
+            average_agreement
+        ),
     }
+
+    # ================================================================
+    # RESULT
+    # ================================================================
+
+    return {
+        "metrics": metrics,
+
+        "trades": trades_df,
+
+        "equity_curve": equity_curve,
+
+        "features": features,
+
+        "config": config,
+
+        "final_capital": float(
+            capital
+        ),
+
+        "total_return": float(
+            equity_metrics[
+                "total_return"
+            ]
+        ),
+
+        "max_drawdown": float(
+            equity_metrics[
+                "max_drawdown_pct"
+            ]
+        ),
+    }
+
+
+# =====================================================================
+# COMPATIBILITY WRAPPER
+# =====================================================================
 
 
 def backtest(
     df: pd.DataFrame,
-    config: BacktestConfig | None = None,
+    horizon: int = 5,
+    probability_threshold: float = 0.60,
+    stop_loss_pct: float = 0.03,
+    target_pct: float = 0.06,
+    risk_per_trade: float = 0.01,
+    transaction_cost: float = 0.001,
+    slippage: float = 0.0005,
+    retrain_every: int = 20,
+    min_train_rows: int = 180,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """
-    Backward-compatible wrapper around run_backtest().
+    Backward-compatible backtest() function.
     """
+
+    config = BacktestConfig(
+        horizon=int(
+            horizon
+        ),
+        probability_threshold=float(
+            probability_threshold
+        ),
+        stop_loss_pct=float(
+            stop_loss_pct
+        ),
+        target_pct=float(
+            target_pct
+        ),
+        risk_per_trade=float(
+            risk_per_trade
+        ),
+        transaction_cost=float(
+            transaction_cost
+        ),
+        slippage=float(
+            slippage
+        ),
+        retrain_every=int(
+            retrain_every
+        ),
+        min_train_rows=int(
+            min_train_rows
+        ),
+    )
 
     return run_backtest(
         df,
         config=config,
     )
+
+
+# =====================================================================
+# FEATURE COMPATIBILITY
+# =====================================================================
+
+
+def build_features(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Compatibility wrapper.
+
+    Uses the project's central feature engine.
+    """
+
+    return globals()[
+        "_build_features"
+    ](df)
+
+
+# Keep original engine reference.
+_build_features = globals()[
+    "build_features"
+]
 
 
 __all__ = [
