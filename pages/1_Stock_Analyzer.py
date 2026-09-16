@@ -892,6 +892,103 @@ if component_probabilities:
             )
 
 
+
+# =====================================================================
+# COMPONENT VALIDATION & WEIGHTS
+# =====================================================================
+
+st.subheader(
+    "📊 Ensemble Component Validation"
+)
+
+reliability_model = result.get("model")
+
+component_metrics = getattr(
+    reliability_model,
+    "component_validation_metrics_",
+    {},
+)
+
+component_weights = getattr(
+    reliability_model,
+    "component_weights",
+    {},
+)
+
+if isinstance(component_metrics, dict) and component_metrics:
+
+    validation_rows = []
+
+    for name, metrics in component_metrics.items():
+
+        if not isinstance(metrics, dict):
+            continue
+
+        try:
+            oof_samples = int(metrics.get("oof_samples", 0))
+        except Exception:
+            oof_samples = 0
+
+        try:
+            logloss = float(metrics.get("log_loss", np.nan))
+        except Exception:
+            logloss = np.nan
+
+        try:
+            roc_auc = float(metrics.get("roc_auc", np.nan))
+        except Exception:
+            roc_auc = np.nan
+
+        try:
+            weight = float(component_weights.get(name, np.nan))
+        except Exception:
+            weight = np.nan
+
+        validation_rows.append(
+            {
+                "Model": name,
+                "Ensemble Weight": (
+                    f"{weight:.1%}"
+                    if np.isfinite(weight)
+                    else "N/A"
+                ),
+                "OOF Samples": oof_samples,
+                "ROC-AUC": (
+                    f"{roc_auc:.3f}"
+                    if np.isfinite(roc_auc)
+                    else "N/A"
+                ),
+                "Log Loss": (
+                    f"{logloss:.4f}"
+                    if np.isfinite(logloss)
+                    else "N/A"
+                ),
+            }
+        )
+
+    if validation_rows:
+
+        st.dataframe(
+            pd.DataFrame(validation_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.caption(
+            "OOF = out-of-fold validation. Ensemble weights are "
+            "derived conservatively from chronological validation "
+            "performance; lower log loss indicates better probability "
+            "quality."
+        )
+
+else:
+
+    st.info(
+        "Component-level validation diagnostics are not available "
+        "for this model run."
+    )
+
+
 # =====================================================================
 # MARKET STRUCTURE
 # =====================================================================
