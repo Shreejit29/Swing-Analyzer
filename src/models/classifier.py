@@ -24,6 +24,11 @@ from __future__ import annotations
 from typing import Optional
 import hashlib
 
+# Process-local model cache. Streamlit reruns the app script frequently, but
+# imported modules remain alive; this cache prevents identical model retraining.
+_MODEL_CACHE = {}
+_MODEL_CACHE_MAX = 12
+
 import numpy as np
 import pandas as pd
 
@@ -489,6 +494,19 @@ class EnsembleSwingClassifier:
             self.training_data_fingerprint_ = None
             self.model_fingerprint_ = None
 
+        # Reuse an already-fitted model when the exact labelled training
+        # snapshot and configuration are unchanged. This is the main latency
+        # optimization for Streamlit reruns: it avoids repeating 25 OOF fits
+        # plus the 5 production fits for the same data.
+        cache_key = (
+            self.training_data_fingerprint_,
+            self.model_fingerprint_,
+        )
+        cached_model = _MODEL_CACHE.get(cache_key)
+        if cached_model is not None:
+            self.__dict__.update(cached_model.__dict__)
+            return self
+
         counts = y.value_counts().to_dict()
         self.class_balance = {
             "down": int(counts.get(0, 0)),
@@ -856,6 +874,15 @@ class EnsembleSwingClassifier:
                 production_prediction,
             )
         )
+
+        # Store the complete fitted classifier and diagnostics. The cache is
+        # bounded so switching among many stocks/horizons cannot grow memory
+        # without limit.
+        if cache_key[0] is not None and cache_key[1] is not None:
+            if len(_MODEL_CACHE) >= _MODEL_CACHE_MAX:
+                oldest_key = next(iter(_MODEL_CACHE))
+                _MODEL_CACHE.pop(oldest_key, None)
+            _MODEL_CACHE[cache_key] = self
 
         return self
 
@@ -1277,6 +1304,11 @@ class EnsembleSwingClassifier:
         }
 
 
+def clear_model_cache() -> None:
+    """Clear fitted model cache when a forced retraining is required."""
+    _MODEL_CACHE.clear()
+
+
 # ----------------------------------------------------------------------
 # Backward-compatible names used by the application
 # ----------------------------------------------------------------------
@@ -1288,4 +1320,5 @@ __all__ = [
     "EnsembleSwingClassifier",
     "GradientBoostingSwingClassifier",
     "SwingClassifier",
+    "clear_model_cache",
 ]
