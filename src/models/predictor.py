@@ -1,8 +1,7 @@
 """
 Swing Stock Predictor
-=====================
 
-Optimized evidence pipeline:
+Complete evidence pipeline:
 
 OHLCV
   -> Technical / Price Action / Volume
@@ -16,40 +15,21 @@ OHLCV
   -> Evidence Fusion
   -> BUY / SELL / WAIT
   -> Risk Plan
-
-Performance principles:
-- Predict only the latest row for live analysis.
-- Avoid repeated full-history model predictions.
-- Cache expensive Streamlit calculations.
-- Preserve backward compatibility with the existing UI.
 """
 
 from __future__ import annotations
 
-import time
 from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
 
 from src.features.engine import build_features
+from src.features.regime import market_regime
 from src.models.classifier import SwingClassifier
 from src.data.sentiment import get_stock_sentiment
 from src.data.market import market_summary
 from src.data.sector import get_sector, sector_summary
-
-
-# ---------------------------------------------------------------------
-# OPTIONAL STREAMLIT CACHE
-# ---------------------------------------------------------------------
-
-try:
-    import streamlit as st
-
-    _STREAMLIT_AVAILABLE = True
-except Exception:
-    st = None
-    _STREAMLIT_AVAILABLE = False
 
 
 # =====================================================================
@@ -76,6 +56,7 @@ def _safe_float(
     value: Any,
     default: float = 0.0,
 ) -> float:
+
     try:
         result = float(value)
 
@@ -126,7 +107,9 @@ def _latest_text(
     return str(value)
 
 
-def _latest_close(df: pd.DataFrame) -> float:
+def _latest_close(
+    df: pd.DataFrame,
+) -> float:
 
     if "close" not in df.columns:
         raise ValueError(
@@ -144,116 +127,6 @@ def _latest_close(df: pd.DataFrame) -> float:
         )
 
     return float(values.iloc[-1])
-
-
-# =====================================================================
-# CACHE HELPERS
-# =====================================================================
-
-# These caches are intentionally short-lived because market/news data
-# changes during the trading day.
-
-
-def _cached_market_summary():
-    """
-    Cache broad-market context for a short period.
-
-    This avoids repeated Yahoo Finance requests when Streamlit reruns
-    because of UI interaction.
-    """
-
-    try:
-        return market_summary()
-    except Exception:
-        return {
-            "trend": "UNKNOWN",
-            "momentum": "UNKNOWN",
-            "volatility": "UNKNOWN",
-            "strength": "UNKNOWN",
-            "volume": "UNKNOWN",
-            "score": 0.0,
-        }
-
-
-def _cached_sentiment(
-    ticker: str,
-    max_items: int = 20,
-):
-    """
-    Cached news sentiment.
-
-    News is intentionally cached only briefly so the application
-    does not repeatedly request the same news during Streamlit reruns.
-    """
-
-    try:
-        return get_stock_sentiment(
-            ticker=ticker,
-            max_items=max_items,
-        )
-    except Exception:
-        return {
-            "ticker": ticker,
-            "news": pd.DataFrame(),
-            "summary": {
-                "score": 0.0,
-                "label": "NO DATA",
-                "articles": 0,
-                "positive": 0,
-                "neutral": 0,
-                "negative": 0,
-            },
-            "recent_score": 0.0,
-        }
-
-
-# Apply Streamlit caching only when Streamlit is actually available.
-if _STREAMLIT_AVAILABLE:
-
-    try:
-
-        _cached_market_summary = st.cache_data(
-            ttl=300,
-            show_spinner=False,
-        )(_cached_market_summary)
-
-        _cached_sentiment = st.cache_data(
-            ttl=300,
-            show_spinner=False,
-        )(_cached_sentiment)
-
-    except Exception:
-        pass
-
-
-# =====================================================================
-# FEATURE CACHE
-# =====================================================================
-
-
-def _build_features_cached(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Feature-engineering cache.
-
-    Streamlit reruns frequently. Rebuilding hundreds of technical,
-    price-action, volume and MTF features unnecessarily can add
-    noticeable latency.
-    """
-
-    return build_features(df)
-
-
-if _STREAMLIT_AVAILABLE:
-
-    try:
-
-        _build_features_cached = st.cache_data(
-            ttl=1800,
-            show_spinner=False,
-        )(_build_features_cached)
-
-    except Exception:
-        pass
 
 
 # =====================================================================
@@ -299,10 +172,6 @@ def _calculate_market_structure(
         "ema200",
         0.0,
     )
-
-    # ---------------------------------------------------------------
-    # TREND
-    # ---------------------------------------------------------------
 
     trend_score = 0.0
 
@@ -414,9 +283,15 @@ def _calculate_market_structure(
         "trend": trend,
         "momentum": momentum,
         "volume": volume,
-        "trend_score": float(trend_score),
-        "momentum_score": float(momentum_score),
-        "volume_score": float(volume_score),
+        "trend_score": float(
+            trend_score
+        ),
+        "momentum_score": float(
+            momentum_score
+        ),
+        "volume_score": float(
+            volume_score
+        ),
         "adx": float(adx),
     }
 
@@ -427,12 +302,21 @@ def _calculate_market_structure(
 
 
 def _get_market_context() -> Dict[str, Any]:
+    """
+    Obtain broad-market context.
+
+    The existing market.py module is used as the single source
+    for market-level calculations.
+    """
 
     try:
 
-        summary = _cached_market_summary()
+        summary = market_summary()
 
-        if isinstance(summary, dict):
+        if isinstance(
+            summary,
+            dict,
+        ):
             return summary
 
     except Exception:
@@ -456,21 +340,34 @@ def _get_market_context() -> Dict[str, Any]:
 def _get_sector_context(
     ticker: str,
 ) -> Dict[str, Any]:
+    """
+    Obtain sector classification and sector context.
+    """
 
     try:
-        sector = get_sector(ticker)
+
+        sector = get_sector(
+            ticker
+        )
 
     except Exception:
+
         sector = "UNKNOWN"
 
     try:
 
-        summary = sector_summary(sector)
+        summary = sector_summary(
+            sector
+        )
 
-        if not isinstance(summary, dict):
+        if not isinstance(
+            summary,
+            dict,
+        ):
             summary = {}
 
     except Exception:
+
         summary = {}
 
     return {
@@ -488,6 +385,14 @@ def _calculate_relative_strength(
     stock_features: pd.DataFrame,
     market_context: Dict[str, Any],
 ) -> Dict[str, Any]:
+    """
+    Estimate stock momentum relative to the broad market.
+
+    When a market return feature is unavailable, this falls back
+    to the stock's own multi-period return.
+
+    This is contextual evidence, not a standalone trading signal.
+    """
 
     stock_return = 0.0
 
@@ -507,6 +412,7 @@ def _calculate_relative_strength(
             )
 
             if np.isfinite(value):
+
                 stock_return = value
                 break
 
@@ -528,10 +434,14 @@ def _calculate_relative_strength(
             )
 
             if np.isfinite(value):
+
                 market_return = value
                 break
 
-    relative = stock_return - market_return
+    relative = (
+        stock_return
+        - market_return
+    )
 
     if relative > 0.03:
         classification = "OUTPERFORMING"
@@ -543,9 +453,15 @@ def _calculate_relative_strength(
         classification = "IN LINE"
 
     return {
-        "stock_return": float(stock_return),
-        "market_return": float(market_return),
-        "relative_return": float(relative),
+        "stock_return": float(
+            stock_return
+        ),
+        "market_return": float(
+            market_return
+        ),
+        "relative_return": float(
+            relative
+        ),
         "classification": classification,
     }
 
@@ -561,6 +477,14 @@ def _context_adjustment(
     sector_context: Dict[str, Any],
     relative_strength: Dict[str, Any],
 ) -> Dict[str, Any]:
+    """
+    Apply a small contextual adjustment.
+
+    The ML ensemble remains the primary quantitative component.
+
+    Context influence is capped so that market/sector data cannot
+    arbitrarily override the ensemble.
+    """
 
     p = float(
         np.clip(
@@ -595,30 +519,40 @@ def _context_adjustment(
     if "BULL" in market_trend:
 
         adjustment += 0.025
-        reasons.append("BROAD MARKET BULLISH")
+        reasons.append(
+            "BROAD MARKET BULLISH"
+        )
 
     elif "BEAR" in market_trend:
 
         adjustment -= 0.025
-        reasons.append("BROAD MARKET BEARISH")
+        reasons.append(
+            "BROAD MARKET BEARISH"
+        )
 
     elif market_score > 0.50:
 
         adjustment += 0.015
-        reasons.append("POSITIVE MARKET SCORE")
+        reasons.append(
+            "POSITIVE MARKET SCORE"
+        )
 
     elif market_score < -0.50:
 
         adjustment -= 0.015
-        reasons.append("NEGATIVE MARKET SCORE")
+        reasons.append(
+            "NEGATIVE MARKET SCORE"
+        )
 
     # ---------------------------------------------------------------
     # SECTOR
     # ---------------------------------------------------------------
 
-    sector_summary_data = sector_context.get(
-        "summary",
-        {},
+    sector_summary_data = (
+        sector_context.get(
+            "summary",
+            {},
+        )
     )
 
     if isinstance(
@@ -752,20 +686,25 @@ def _sentiment_adjustment(
     )
 
     sentiment_weight = (
-        0.10 * article_confidence
+        0.10
+        * article_confidence
     )
 
     sentiment_probability = (
-        0.50 + 0.50 * s
+        0.50
+        + 0.50 * s
     )
 
     adjusted_probability = (
-        (1.0 - sentiment_weight) * p
-        + sentiment_weight * sentiment_probability
+        (1.0 - sentiment_weight)
+        * p
+        + sentiment_weight
+        * sentiment_probability
     )
 
     adjustment = (
-        adjusted_probability - p
+        adjusted_probability
+        - p
     )
 
     if s >= 0.20:
@@ -787,7 +726,9 @@ def _sentiment_adjustment(
                 1.0,
             )
         ),
-        "adjustment": float(adjustment),
+        "adjustment": float(
+            adjustment
+        ),
         "sentiment_weight": float(
             sentiment_weight
         ),
@@ -851,20 +792,303 @@ def _apply_agreement_filter(
 
     if agreement < 0.60:
 
-        if p > 0.85 or p < 0.15:
+        if (
+            p > 0.85
+            or p < 0.15
+        ):
             return signal
 
         return "WAIT"
 
     if agreement < 0.80:
 
-        if signal == "BUY" and p < 0.65:
+        if (
+            signal == "BUY"
+            and p < 0.65
+        ):
             return "WAIT"
 
-        if signal == "SELL" and p > 0.35:
+        if (
+            signal == "SELL"
+            and p > 0.35
+        ):
             return "WAIT"
 
     return signal
+
+
+# =====================================================================
+# 90% CONFIDENCE GATE
+# =====================================================================
+
+
+def _extract_validation_reliability(model) -> Dict[str, Any]:
+    """Summarize historical validation behavior around the 90% confidence zone."""
+    if model is None:
+        return {
+            "available": False,
+            "sample_count": 0,
+            "high_confidence_samples": 0,
+            "high_confidence_accuracy": None,
+            "ece": None,
+        }
+
+    probability_names = [
+        "validation_probabilities_",
+        "validation_probability_",
+        "validation_probs_",
+    ]
+    actual_names = [
+        "validation_actuals_",
+        "validation_actual_",
+        "validation_y_",
+        "validation_targets_",
+    ]
+
+    probabilities = None
+    actuals = None
+
+    for name in probability_names:
+        value = getattr(model, name, None)
+        if value is not None:
+            probabilities = value
+            break
+
+    for name in actual_names:
+        value = getattr(model, name, None)
+        if value is not None:
+            actuals = value
+            break
+
+    if probabilities is None or actuals is None:
+        return {
+            "available": False,
+            "sample_count": 0,
+            "high_confidence_samples": 0,
+            "high_confidence_accuracy": None,
+            "ece": None,
+        }
+
+    try:
+        probs = np.asarray(probabilities, dtype=float)
+        y = np.asarray(actuals, dtype=float).reshape(-1)
+
+        if probs.ndim == 2 and probs.shape[1] >= 2:
+            p_up = probs[:, 1]
+            p_down = probs[:, 0]
+        elif probs.ndim == 1:
+            p_up = probs
+            p_down = 1.0 - probs
+        else:
+            raise ValueError("Unsupported validation probability shape")
+
+        n = min(len(p_up), len(p_down), len(y))
+        if n <= 0:
+            raise ValueError("No validation observations")
+
+        frame = pd.DataFrame({
+            "p_up": p_up[:n],
+            "p_down": p_down[:n],
+            "actual": y[:n],
+        })
+        frame = frame.replace([np.inf, -np.inf], np.nan).dropna()
+        frame = frame[frame["actual"].isin([0.0, 1.0])].copy()
+
+        if frame.empty:
+            raise ValueError("No valid validation observations")
+
+        frame["confidence"] = frame[["p_up", "p_down"]].max(axis=1)
+        frame["predicted"] = (frame["p_up"] >= 0.50).astype(int)
+        frame["correct"] = (frame["predicted"] == frame["actual"]).astype(float)
+
+        high = frame[frame["confidence"] >= 0.90]
+        high_accuracy = (
+            float(high["correct"].mean())
+            if not high.empty
+            else None
+        )
+
+        # Confidence calibration error across fixed confidence bands.
+        bins = [0.50, 0.60, 0.70, 0.80, 0.90, 1.000001]
+        ece = 0.0
+        total = len(frame)
+        for left, right in zip(bins[:-1], bins[1:]):
+            bucket = frame[
+                (frame["confidence"] >= left)
+                & (frame["confidence"] < right)
+            ]
+            if bucket.empty:
+                continue
+            ece += (
+                len(bucket) / total
+            ) * abs(
+                float(bucket["confidence"].mean())
+                - float(bucket["correct"].mean())
+            )
+
+        return {
+            "available": True,
+            "sample_count": int(len(frame)),
+            "high_confidence_samples": int(len(high)),
+            "high_confidence_accuracy": high_accuracy,
+            "ece": float(ece),
+        }
+
+    except Exception:
+        return {
+            "available": False,
+            "sample_count": 0,
+            "high_confidence_samples": 0,
+            "high_confidence_accuracy": None,
+            "ece": None,
+        }
+
+
+def _build_confidence_gate(
+    *,
+    signal: str,
+    probability_up: float,
+    agreement: float,
+    weekly_trend: str,
+    monthly_trend: str,
+    three_timeframe_alignment: str,
+    market_context: Dict[str, Any],
+    sector_context: Dict[str, Any],
+    relative_strength: Dict[str, Any],
+    sentiment_score: float,
+    validation_reliability: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Determine whether the current setup qualifies as a 90% evidence-grade setup."""
+    p_up = float(np.clip(probability_up, 0.0, 1.0))
+    p_down = 1.0 - p_up
+    strongest = max(p_up, p_down)
+    direction = "BUY" if p_up >= p_down else "SELL"
+
+    checks = []
+
+    checks.append({
+        "name": "Model probability",
+        "passed": strongest >= 0.90,
+        "detail": f"{strongest:.1%} >= 90%",
+    })
+
+    checks.append({
+        "name": "Ensemble agreement",
+        "passed": agreement >= 0.80,
+        "detail": f"{agreement:.1%} >= 80%",
+    })
+
+    def direction_matches(text: str, bullish: bool) -> bool:
+        value = str(text).upper()
+        if bullish:
+            return "BULL" in value or "POSITIVE" in value or "ALIGNED" in value
+        return "BEAR" in value or "NEGATIVE" in value or "ALIGNED" in value
+
+    bullish = direction == "BUY"
+
+    checks.append({
+        "name": "Weekly trend",
+        "passed": direction_matches(weekly_trend, bullish),
+        "detail": str(weekly_trend),
+    })
+    checks.append({
+        "name": "Monthly trend",
+        "passed": direction_matches(monthly_trend, bullish),
+        "detail": str(monthly_trend),
+    })
+
+    alignment = str(three_timeframe_alignment).upper()
+    alignment_pass = (
+        (bullish and "BULL" in alignment)
+        or ((not bullish) and "BEAR" in alignment)
+    )
+    checks.append({
+        "name": "Timeframe alignment",
+        "passed": alignment_pass,
+        "detail": alignment,
+    })
+
+    market_trend = str(market_context.get("trend", "UNKNOWN")).upper()
+    market_pass = (
+        (bullish and "BEAR" not in market_trend)
+        or ((not bullish) and "BULL" not in market_trend)
+    )
+    checks.append({
+        "name": "Market context",
+        "passed": market_pass,
+        "detail": market_trend,
+    })
+
+    sector_summary_data = sector_context.get("summary", {})
+    sector_score = _safe_float(
+        sector_summary_data.get("score", 0.0)
+        if isinstance(sector_summary_data, dict)
+        else 0.0,
+        0.0,
+    )
+    sector_pass = sector_score >= 0.0 if bullish else sector_score <= 0.0
+    checks.append({
+        "name": "Sector context",
+        "passed": sector_pass,
+        "detail": f"score {sector_score:+.2f}",
+    })
+
+    relative_class = str(relative_strength.get("classification", "IN LINE")).upper()
+    relative_pass = (
+        (bullish and relative_class != "UNDERPERFORMING")
+        or ((not bullish) and relative_class != "OUTPERFORMING")
+    )
+    checks.append({
+        "name": "Relative strength",
+        "passed": relative_pass,
+        "detail": relative_class,
+    })
+
+    sentiment_pass = (
+        sentiment_score >= -0.20 if bullish
+        else sentiment_score <= 0.20
+    )
+    checks.append({
+        "name": "News sentiment",
+        "passed": sentiment_pass,
+        "detail": f"score {sentiment_score:+.2f}",
+    })
+
+    reliability_available = bool(validation_reliability.get("available"))
+    high_samples = int(validation_reliability.get("high_confidence_samples", 0))
+    high_accuracy = validation_reliability.get("high_confidence_accuracy")
+
+    # A historical 90% bucket is evidence only when enough observations exist.
+    # With fewer than 10 observations we do not claim that the 90% zone is validated.
+    reliability_pass = (
+        reliability_available
+        and high_samples >= 10
+        and high_accuracy is not None
+        and float(high_accuracy) >= 0.90
+    )
+    checks.append({
+        "name": "Historical 90% reliability",
+        "passed": reliability_pass,
+        "detail": (
+            f"{high_accuracy:.1%} over {high_samples} samples"
+            if high_accuracy is not None
+            else "insufficient validation evidence"
+        ),
+    })
+
+    passed = sum(bool(item["passed"]) for item in checks)
+    total = len(checks)
+
+    return {
+        "eligible": bool(signal in {"BUY", "SELL"} and all(item["passed"] for item in checks)),
+        "direction": direction,
+        "strongest_probability": float(strongest),
+        "checks": checks,
+        "passed_checks": int(passed),
+        "total_checks": int(total),
+        "validation_reliability": validation_reliability,
+        "label": "HIGH-CONFIDENCE 90% SETUP" if signal in {"BUY", "SELL"} and all(item["passed"] for item in checks) else "STANDARD SETUP",
+    }
 
 
 # =====================================================================
@@ -885,8 +1109,12 @@ def _build_trade_plan(
             "entry": None,
             "stop_loss": None,
             "target": None,
-            "risk_percent": stop_loss_pct * 100,
-            "reward_percent": target_pct * 100,
+            "risk_percent": (
+                stop_loss_pct * 100
+            ),
+            "reward_percent": (
+                target_pct * 100
+            ),
             "risk_reward": (
                 target_pct / stop_loss_pct
                 if stop_loss_pct > 0
@@ -898,22 +1126,26 @@ def _build_trade_plan(
 
     if signal == "BUY":
 
-        stop_loss = entry * (
-            1.0 - stop_loss_pct
+        stop_loss = (
+            entry
+            * (1.0 - stop_loss_pct)
         )
 
-        target = entry * (
-            1.0 + target_pct
+        target = (
+            entry
+            * (1.0 + target_pct)
         )
 
     elif signal == "SELL":
 
-        stop_loss = entry * (
-            1.0 + stop_loss_pct
+        stop_loss = (
+            entry
+            * (1.0 + stop_loss_pct)
         )
 
-        target = entry * (
-            1.0 - target_pct
+        target = (
+            entry
+            * (1.0 - target_pct)
         )
 
     else:
@@ -961,9 +1193,10 @@ def analyze_stock(
     ticker: str = "",
 ) -> PredictionResult:
 
-    total_start = time.perf_counter()
-
-    if not isinstance(df, pd.DataFrame):
+    if not isinstance(
+        df,
+        pd.DataFrame,
+    ):
         raise TypeError(
             "df must be a pandas DataFrame."
         )
@@ -973,7 +1206,9 @@ def analyze_stock(
             "Input DataFrame is empty."
         )
 
-    horizon = int(horizon)
+    horizon = int(
+        horizon
+    )
 
     if horizon < 1:
         raise ValueError(
@@ -984,9 +1219,9 @@ def analyze_stock(
     # FEATURE ENGINEERING
     # ================================================================
 
-    feature_start = time.perf_counter()
-
-    features = _build_features_cached(df)
+    features = build_features(
+        df
+    )
 
     if (
         features is None
@@ -996,15 +1231,9 @@ def analyze_stock(
             "Feature engineering produced no data."
         )
 
-    feature_seconds = (
-        time.perf_counter() - feature_start
-    )
-
     # ================================================================
     # ML ENSEMBLE
     # ================================================================
-
-    ml_start = time.perf_counter()
 
     model = SwingClassifier(
         horizon=horizon,
@@ -1013,25 +1242,14 @@ def analyze_stock(
         ),
     )
 
-    model.fit(features)
+    model.fit(
+        features
+    )
 
-    # IMPORTANT PERFORMANCE OPTIMIZATION:
-    #
-    # The old implementation predicted the complete historical
-    # dataframe. The live application only needs the latest row.
-    #
-    # This changes:
-    #
-    #     predict(all rows)
-    #
-    # into:
-    #
-    #     predict(latest row)
-    #
-    latest_features = features.tail(1)
-
-    probabilities = model.predict_proba(
-        latest_features
+    probabilities = (
+        model.predict_proba(
+            features
+        )
     )
 
     if len(probabilities) == 0:
@@ -1050,17 +1268,19 @@ def analyze_stock(
     )
 
     total_probability = (
-        probability_up + probability_down
+        probability_up
+        + probability_down
     )
 
     if total_probability > 0:
 
-        probability_up /= total_probability
-        probability_down /= total_probability
+        probability_up /= (
+            total_probability
+        )
 
-    ml_seconds = (
-        time.perf_counter() - ml_start
-    )
+        probability_down /= (
+            total_probability
+        )
 
     # ================================================================
     # MODEL AGREEMENT
@@ -1068,9 +1288,10 @@ def analyze_stock(
 
     try:
 
-        # Only the latest row is required.
-        model_agreement = model.model_agreement(
-            latest_features
+        model_agreement = (
+            model.model_agreement(
+                features
+            )
         )
 
     except Exception:
@@ -1088,7 +1309,7 @@ def analyze_stock(
 
         component_probabilities = (
             model.component_probabilities(
-                latest_features
+                features
             )
         )
 
@@ -1100,16 +1321,18 @@ def analyze_stock(
     # MARKET CONTEXT
     # ================================================================
 
-    context_start = time.perf_counter()
-
-    market_context = _get_market_context()
+    market_context = (
+        _get_market_context()
+    )
 
     # ================================================================
     # SECTOR CONTEXT
     # ================================================================
 
-    sector_context = _get_sector_context(
-        ticker
+    sector_context = (
+        _get_sector_context(
+            ticker
+        )
     )
 
     # ================================================================
@@ -1127,26 +1350,24 @@ def analyze_stock(
     # MARKET / SECTOR ADJUSTMENT
     # ================================================================
 
-    context_fusion = _context_adjustment(
-        probability_up=probability_up,
-        market_context=market_context,
-        sector_context=sector_context,
-        relative_strength=relative_strength,
+    context_fusion = (
+        _context_adjustment(
+            probability_up=probability_up,
+            market_context=market_context,
+            sector_context=sector_context,
+            relative_strength=relative_strength,
+        )
     )
 
-    context_probability = context_fusion[
-        "adjusted_probability"
-    ]
-
-    context_seconds = (
-        time.perf_counter() - context_start
+    context_probability = (
+        context_fusion[
+            "adjusted_probability"
+        ]
     )
 
     # ================================================================
     # NEWS SENTIMENT
     # ================================================================
-
-    sentiment_start = time.perf_counter()
 
     sentiment_data = {
         "ticker": ticker,
@@ -1164,10 +1385,17 @@ def analyze_stock(
 
     if ticker:
 
-        sentiment_data = _cached_sentiment(
-            ticker=ticker,
-            max_items=20,
-        )
+        try:
+
+            sentiment_data = (
+                get_stock_sentiment(
+                    ticker=ticker,
+                    max_items=20,
+                )
+            )
+
+        except Exception:
+            pass
 
     sentiment_summary_data = (
         sentiment_data.get(
@@ -1202,18 +1430,24 @@ def analyze_stock(
         )
     )
 
-    sentiment_fusion = _sentiment_adjustment(
-        probability_up=context_probability,
-        sentiment_score=sentiment_score,
-        sentiment_articles=sentiment_articles,
+    sentiment_fusion = (
+        _sentiment_adjustment(
+            probability_up=(
+                context_probability
+            ),
+            sentiment_score=(
+                sentiment_score
+            ),
+            sentiment_articles=(
+                sentiment_articles
+            ),
+        )
     )
 
-    final_probability = sentiment_fusion[
-        "adjusted_probability"
-    ]
-
-    sentiment_seconds = (
-        time.perf_counter() - sentiment_start
+    final_probability = (
+        sentiment_fusion[
+            "adjusted_probability"
+        ]
     )
 
     # ================================================================
@@ -1225,16 +1459,20 @@ def analyze_stock(
         probability_threshold,
     )
 
-    final_signal = _apply_agreement_filter(
-        signal=base_signal,
-        probability_up=final_probability,
-        agreement=_safe_float(
-            model_agreement.get(
-                "agreement",
+    final_signal = (
+        _apply_agreement_filter(
+            signal=base_signal,
+            probability_up=(
+                final_probability
+            ),
+            agreement=_safe_float(
+                model_agreement.get(
+                    "agreement",
+                    0.0,
+                ),
                 0.0,
             ),
-            0.0,
-        ),
+        )
     )
 
     # ================================================================
@@ -1246,41 +1484,53 @@ def analyze_stock(
         - (1.0 - final_probability)
     )
 
-    uncertainty = 1.0 - confidence
+    uncertainty = (
+        1.0 - confidence
+    )
 
     # ================================================================
     # MARKET REGIME
     # ================================================================
 
-    # Avoid calling market_regime(features) again.
-    #
-    # The feature engine already creates regime information.
-    # Reading the latest value is substantially cheaper.
+    try:
 
-    regime = _latest_text(
-        features,
-        "regime",
-        "UNKNOWN",
-    )
+        regime = market_regime(
+            features
+        )
 
-    # Some versions may use a different regime column.
-    if regime == "UNKNOWN":
+    except Exception:
 
-        for regime_column in [
-            "market_regime",
-            "regime_label",
-            "market_regime_label",
-        ]:
+        regime = "UNKNOWN"
 
-            candidate = _latest_text(
-                features,
-                regime_column,
-                "UNKNOWN",
+    if isinstance(
+        regime,
+        pd.Series,
+    ):
+
+        regime = (
+            str(regime.iloc[-1])
+            if len(regime)
+            else "UNKNOWN"
+        )
+
+    if isinstance(
+        regime,
+        pd.DataFrame,
+    ):
+
+        if not regime.empty:
+
+            regime = str(
+                regime.iloc[-1, 0]
             )
 
-            if candidate != "UNKNOWN":
-                regime = candidate
-                break
+        else:
+
+            regime = "UNKNOWN"
+
+    regime = str(
+        regime
+    )
 
     # ================================================================
     # MULTI-TIMEFRAME
@@ -1298,24 +1548,53 @@ def analyze_stock(
         "UNKNOWN",
     )
 
-    higher_timeframe_score = _latest_value(
-        features,
-        "higher_timeframe_score",
-        0.0,
+    higher_timeframe_score = (
+        _latest_value(
+            features,
+            "higher_timeframe_score",
+            0.0,
+        )
     )
 
-    three_timeframe_alignment = _latest_text(
-        features,
-        "three_timeframe_alignment",
-        "UNKNOWN",
+    three_timeframe_alignment = (
+        _latest_text(
+            features,
+            "three_timeframe_alignment",
+            "UNKNOWN",
+        )
     )
 
     # ================================================================
     # STRUCTURE
     # ================================================================
 
-    structure = _calculate_market_structure(
-        features
+    structure = (
+        _calculate_market_structure(
+            features
+        )
+    )
+
+    # ================================================================
+    # 90% CONFIDENCE EVIDENCE GATE
+    # ================================================================
+
+    validation_reliability = _extract_validation_reliability(model)
+
+    confidence_gate = _build_confidence_gate(
+        signal=final_signal,
+        probability_up=final_probability,
+        agreement=_safe_float(
+            model_agreement.get("agreement", 0.0),
+            0.0,
+        ),
+        weekly_trend=weekly_trend,
+        monthly_trend=monthly_trend,
+        three_timeframe_alignment=three_timeframe_alignment,
+        market_context=market_context,
+        sector_context=sector_context,
+        relative_strength=relative_strength,
+        sentiment_score=sentiment_score,
+        validation_reliability=validation_reliability,
     )
 
     # ================================================================
@@ -1326,11 +1605,13 @@ def analyze_stock(
         features
     )
 
-    trade_plan = _build_trade_plan(
-        current_price=current_price,
-        signal=final_signal,
-        stop_loss_pct=stop_loss_pct,
-        target_pct=target_pct,
+    trade_plan = (
+        _build_trade_plan(
+            current_price=current_price,
+            signal=final_signal,
+            stop_loss_pct=stop_loss_pct,
+            target_pct=target_pct,
+        )
     )
 
     # ================================================================
@@ -1339,17 +1620,23 @@ def analyze_stock(
 
     try:
 
-        importance_df = model.feature_importance()
+        importance_df = (
+            model.feature_importance()
+        )
 
         top_features = (
             importance_df
             .head(10)
-            .to_dict("records")
+            .to_dict(
+                "records"
+            )
         )
 
         feature_importance = (
             importance_df
-            .to_dict("records")
+            .to_dict(
+                "records"
+            )
         )
 
     except Exception:
@@ -1373,59 +1660,14 @@ def analyze_stock(
     )
 
     # ================================================================
-    # PERFORMANCE DIAGNOSTICS
-    # ================================================================
-
-    total_seconds = (
-        time.perf_counter()
-        - total_start
-    )
-
-    performance = {
-        "total_seconds": round(
-            total_seconds,
-            3,
-        ),
-        "feature_seconds": round(
-            feature_seconds,
-            3,
-        ),
-        "ml_seconds": round(
-            ml_seconds,
-            3,
-        ),
-        "context_seconds": round(
-            context_seconds,
-            3,
-        ),
-        "sentiment_seconds": round(
-            sentiment_seconds,
-            3,
-        ),
-        "cached_features": (
-            _STREAMLIT_AVAILABLE
-        ),
-        "latest_row_prediction": True,
-    }
-
-    # ================================================================
     # RESULT
     # ================================================================
 
     return PredictionResult(
         {
-
-            # --------------------------------------------------------
-            # SIGNAL
-            # --------------------------------------------------------
-
             "signal": final_signal,
 
             "base_signal": base_signal,
-
-            # --------------------------------------------------------
-            # PROBABILITIES
-            # --------------------------------------------------------
 
             "probability_up": float(
                 probability_up
@@ -1447,18 +1689,9 @@ def analyze_stock(
                 final_probability
             ),
 
-            # Kept for backward compatibility.
-            #
-            # Note:
-            # this remains the model probability and should not be
-            # interpreted as a formally walk-forward OOS probability.
             "prediction_probability_oos": float(
                 probability_up
             ),
-
-            # --------------------------------------------------------
-            # CONFIDENCE
-            # --------------------------------------------------------
 
             "confidence": float(
                 confidence
@@ -1467,10 +1700,6 @@ def analyze_stock(
             "uncertainty": float(
                 uncertainty
             ),
-
-            # --------------------------------------------------------
-            # BASIC
-            # --------------------------------------------------------
 
             "horizon": int(
                 horizon
@@ -1503,19 +1732,15 @@ def analyze_stock(
             # --------------------------------------------------------
 
             "sentiment": {
-
                 "score": float(
                     sentiment_score
                 ),
-
                 "label": (
                     sentiment_label_value
                 ),
-
                 "articles": int(
                     sentiment_articles
                 ),
-
                 "positive": int(
                     sentiment_summary_data.get(
                         "positive",
@@ -1523,7 +1748,6 @@ def analyze_stock(
                     )
                     or 0
                 ),
-
                 "neutral": int(
                     sentiment_summary_data.get(
                         "neutral",
@@ -1531,7 +1755,6 @@ def analyze_stock(
                     )
                     or 0
                 ),
-
                 "negative": int(
                     sentiment_summary_data.get(
                         "negative",
@@ -1539,39 +1762,32 @@ def analyze_stock(
                     )
                     or 0
                 ),
-
                 "recent_score": float(
                     sentiment_score
                 ),
-
                 "raw_probability": float(
                     sentiment_fusion[
                         "raw_probability"
                     ]
                 ),
-
                 "adjusted_probability": float(
                     sentiment_fusion[
                         "adjusted_probability"
                     ]
                 ),
-
                 "adjustment": float(
                     sentiment_fusion[
                         "adjustment"
                     ]
                 ),
-
                 "weight": float(
                     sentiment_fusion[
                         "sentiment_weight"
                     ]
                 ),
-
                 "reason": sentiment_fusion[
                     "reason"
                 ],
-
                 "news": news_df,
             },
 
@@ -1645,6 +1861,14 @@ def analyze_stock(
 
             "trade_plan": trade_plan,
 
+            # --------------------------------------------------------
+            # CONFIDENCE GATE
+            # --------------------------------------------------------
+
+            "confidence_gate": confidence_gate,
+
+            "validation_reliability": validation_reliability,
+
             "entry": trade_plan[
                 "entry"
             ],
@@ -1662,67 +1886,56 @@ def analyze_stock(
             # --------------------------------------------------------
 
             "indicators": {
-
                 "rsi14": _latest_value(
                     features,
                     "rsi14",
                     np.nan,
                 ),
-
                 "macd": _latest_value(
                     features,
                     "macd",
                     np.nan,
                 ),
-
                 "macd_signal": _latest_value(
                     features,
                     "macd_signal",
                     np.nan,
                 ),
-
                 "macd_hist": _latest_value(
                     features,
                     "macd_hist",
                     np.nan,
                 ),
-
                 "atr14": _latest_value(
                     features,
                     "atr14",
                     np.nan,
                 ),
-
                 "atr_pct": _latest_value(
                     features,
                     "atr_pct",
                     np.nan,
                 ),
-
                 "ema20": _latest_value(
                     features,
                     "ema20",
                     np.nan,
                 ),
-
                 "ema50": _latest_value(
                     features,
                     "ema50",
                     np.nan,
                 ),
-
                 "ema200": _latest_value(
                     features,
                     "ema200",
                     np.nan,
                 ),
-
                 "relative_volume": _latest_value(
                     features,
                     "relative_volume",
                     np.nan,
                 ),
-
                 "adx": _latest_value(
                     features,
                     "adx",
@@ -1792,27 +2005,19 @@ def analyze_stock(
 
             "model_summary": model_summary,
 
-            # --------------------------------------------------------
-            # DATA
-            # --------------------------------------------------------
-
             "n_rows": int(
                 len(features)
             ),
 
             "n_features": int(
-                len(model.feature_names_)
+                len(
+                    model.feature_names_
+                )
             ),
 
             "features": features,
 
             "model": model,
-
-            # --------------------------------------------------------
-            # PERFORMANCE
-            # --------------------------------------------------------
-
-            "performance": performance,
         }
     )
 
