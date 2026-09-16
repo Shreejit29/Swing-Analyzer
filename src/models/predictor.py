@@ -1,8 +1,22 @@
-# src/models/predictor.py
+"""
+Swing Stock Predictor
+
+Production prediction layer connecting:
+    Data
+    -> Feature Engineering
+    -> Ensemble ML
+    -> Market Regime
+    -> Multi-Timeframe Analysis
+    -> Risk / Trade Plan
+
+The classifier's target construction excludes the most recent
+unlabeled observations, so the latest prediction is generated
+without using its future outcome during training.
+"""
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
@@ -12,95 +26,117 @@ from src.features.regime import market_regime
 from src.models.classifier import SwingClassifier
 
 
+# =====================================================================
+# RESULT OBJECT
+# =====================================================================
+
+
 class PredictionResult(dict):
-    """
-    Dictionary-like prediction result that also supports attribute access.
+    """Dictionary with attribute-style access."""
 
-    Example:
-        result["probability_up"]
-        result.probability_up
-    """
-
-    def __getattr__(self, name: str) -> Any:
+    def __getattr__(self, name: str):
         try:
             return self[name]
-        except KeyError:
-            raise AttributeError(
-                f"PredictionResult has no attribute '{name}'"
-            ) from None
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        self[name] = value
+        except KeyError as exc:
+            raise AttributeError(name) from exc
 
 
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
+# =====================================================================
+# SAFE HELPERS
+# =====================================================================
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
+
+def _safe_float(
+    value: Any,
+    default: float = 0.0,
+) -> float:
+
     try:
-        if pd.isna(value):
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+        result = float(value)
+
+        if np.isfinite(result):
+            return result
+
+    except Exception:
+        pass
+
+    return float(default)
 
 
 def _latest_value(
     df: pd.DataFrame,
-    columns: list[str],
+    column: str,
     default: float = 0.0,
 ) -> float:
-    for col in columns:
-        if col in df.columns:
-            series = pd.to_numeric(df[col], errors="coerce").dropna()
-            if not series.empty:
-                return _safe_float(series.iloc[-1], default)
-    return default
+
+    if df is None or df.empty:
+        return default
+
+    if column not in df.columns:
+        return default
+
+    value = df[column].iloc[-1]
+
+    return _safe_float(
+        value,
+        default,
+    )
 
 
 def _latest_text(
     df: pd.DataFrame,
-    columns: list[str],
+    column: str,
     default: str = "UNKNOWN",
 ) -> str:
-    for col in columns:
-        if col in df.columns:
-            series = df[col].dropna()
-            if not series.empty:
-                value = str(series.iloc[-1]).strip()
-                if value and value.lower() not in {"nan", "none"}:
-                    return value.upper()
-    return default
+
+    if df is None or df.empty:
+        return default
+
+    if column not in df.columns:
+        return default
+
+    value = df[column].iloc[-1]
+
+    if pd.isna(value):
+        return default
+
+    return str(value)
 
 
-def _latest_close(df: pd.DataFrame) -> float:
-    for col in ["close", "Close"]:
-        if col in df.columns:
-            series = pd.to_numeric(df[col], errors="coerce").dropna()
-            if not series.empty:
-                return float(series.iloc[-1])
+def _latest_close(
+    df: pd.DataFrame,
+) -> float:
 
-    raise ValueError("No valid close price found.")
+    if "close" not in df.columns:
+        raise ValueError(
+            "Input data must contain a 'close' column."
+        )
+
+    value = pd.to_numeric(
+        df["close"],
+        errors="coerce",
+    ).dropna()
+
+    if value.empty:
+        raise ValueError(
+            "No valid closing-price data available."
+        )
+
+    return float(value.iloc[-1])
 
 
-# ---------------------------------------------------------------------
-# Market Structure
-# ---------------------------------------------------------------------
+# =====================================================================
+# MARKET STRUCTURE
+# =====================================================================
 
-def _calculate_market_structure(features: pd.DataFrame) -> Dict[str, Any]:
+
+def _calculate_market_structure(
+    features: pd.DataFrame,
+) -> Dict[str, Any]:
     """
-    Calculate the market structure displayed by the Stock Analyzer.
+    Calculate a transparent market-structure summary.
 
-    Returns:
-        {
-            "trend": ...,
-            "momentum": ...,
-            "volume": ...,
-            "trend_score": ...,
-            "momentum_score": ...,
-            "volume_score": ...,
-        }
+    This is descriptive context and does not override the ML model.
     """
 
     if features is None or features.empty:
@@ -111,259 +147,257 @@ def _calculate_market_structure(features: pd.DataFrame) -> Dict[str, Any]:
             "trend_score": 0.0,
             "momentum_score": 0.0,
             "volume_score": 0.0,
+            "adx": 0.0,
         }
 
-    row = features.iloc[-1]
-
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # TREND
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+
+    close = _latest_value(
+        features,
+        "close",
+        0.0,
+    )
+
+    ema20 = _latest_value(
+        features,
+        "ema20",
+        0.0,
+    )
+
+    ema50 = _latest_value(
+        features,
+        "ema50",
+        0.0,
+    )
+
+    ema200 = _latest_value(
+        features,
+        "ema200",
+        0.0,
+    )
 
     trend_score = 0.0
 
-    close = _safe_float(row.get("close"), np.nan)
-
-    ema20 = _safe_float(row.get("ema20"), np.nan)
-    ema50 = _safe_float(row.get("ema50"), np.nan)
-    ema200 = _safe_float(row.get("ema200"), np.nan)
-
-    ema20_slope = _safe_float(
-        row.get("ema20_slope", row.get("ema20_slope_pct", 0.0))
-    )
-
-    ema50_slope = _safe_float(
-        row.get("ema50_slope", row.get("ema50_slope_pct", 0.0))
-    )
-
-    adx = _safe_float(row.get("adx14", row.get("adx", 0.0)))
-
-    # Price relative to moving averages
-    if np.isfinite(close) and np.isfinite(ema20):
+    if close > 0 and ema20 > 0:
         trend_score += 1.0 if close > ema20 else -1.0
 
-    if np.isfinite(close) and np.isfinite(ema50):
-        trend_score += 1.0 if close > ema50 else -1.0
-
-    if np.isfinite(close) and np.isfinite(ema200):
-        trend_score += 1.0 if close > ema200 else -1.0
-
-    # EMA alignment
-    if np.isfinite(ema20) and np.isfinite(ema50):
+    if ema20 > 0 and ema50 > 0:
         trend_score += 1.0 if ema20 > ema50 else -1.0
 
-    if np.isfinite(ema50) and np.isfinite(ema200):
+    if ema50 > 0 and ema200 > 0:
         trend_score += 1.0 if ema50 > ema200 else -1.0
 
-    # EMA slopes
-    if ema20_slope > 0:
-        trend_score += 0.75
-    elif ema20_slope < 0:
-        trend_score -= 0.75
-
-    if ema50_slope > 0:
-        trend_score += 0.50
-    elif ema50_slope < 0:
-        trend_score -= 0.50
-
-    if trend_score >= 3.0:
+    if trend_score >= 2:
         trend = "BULLISH"
-    elif trend_score <= -3.0:
+    elif trend_score <= -2:
         trend = "BEARISH"
     else:
-        trend = "SIDEWAYS"
+        trend = "NEUTRAL"
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # MOMENTUM
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+
+    rsi = _latest_value(
+        features,
+        "rsi14",
+        50.0,
+    )
+
+    macd_hist = _latest_value(
+        features,
+        "macd_hist",
+        0.0,
+    )
 
     momentum_score = 0.0
 
-    rsi = _safe_float(row.get("rsi14", row.get("rsi", 50.0)), 50.0)
-
-    macd_hist = _safe_float(
-        row.get("macd_hist", row.get("macd_histogram", 0.0))
-    )
-
-    roc10 = _safe_float(row.get("roc10", 0.0))
-    roc20 = _safe_float(row.get("roc20", 0.0))
-
-    # RSI
     if rsi >= 55:
         momentum_score += 1.0
     elif rsi <= 45:
         momentum_score -= 1.0
 
-    # MACD histogram
     if macd_hist > 0:
         momentum_score += 1.0
     elif macd_hist < 0:
         momentum_score -= 1.0
 
-    # Rate of change
-    if roc10 > 0:
-        momentum_score += 0.75
-    elif roc10 < 0:
-        momentum_score -= 0.75
-
-    if roc20 > 0:
-        momentum_score += 0.50
-    elif roc20 < 0:
-        momentum_score -= 0.50
-
-    if momentum_score >= 1.5:
-        momentum = "BULLISH"
-    elif momentum_score <= -1.5:
-        momentum = "BEARISH"
+    if momentum_score >= 1:
+        momentum = "POSITIVE"
+    elif momentum_score <= -1:
+        momentum = "NEGATIVE"
     else:
         momentum = "NEUTRAL"
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
     # VOLUME
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+
+    relative_volume = _latest_value(
+        features,
+        "relative_volume",
+        np.nan,
+    )
 
     volume_score = 0.0
 
-    relative_volume = _safe_float(
-        row.get(
-            "relative_volume",
-            row.get("volume_ratio", 1.0),
-        ),
-        1.0,
-    )
+    if np.isfinite(relative_volume):
+        if relative_volume >= 1.20:
+            volume_score = 1.0
+        elif relative_volume <= 0.80:
+            volume_score = -1.0
 
-    volume_change = _safe_float(
-        row.get("volume_change", 0.0)
-    )
-
-    volume_roc = _safe_float(
-        row.get("volume_roc", 0.0)
-    )
-
-    obv_slope = _safe_float(
-        row.get("obv_slope", 0.0)
-    )
-
-    price_volume_sign = _safe_float(
-        row.get("price_volume_sign", 0.0)
-    )
-
-    # Relative volume
-    if relative_volume >= 1.20:
-        volume_score += 1.0
-    elif relative_volume < 0.80:
-        volume_score -= 0.50
-
-    # Volume direction
-    if volume_change > 0:
-        volume_score += 0.50
-    elif volume_change < 0:
-        volume_score -= 0.25
-
-    if volume_roc > 0:
-        volume_score += 0.50
-    elif volume_roc < 0:
-        volume_score -= 0.25
-
-    # OBV direction
-    if obv_slope > 0:
-        volume_score += 0.75
-    elif obv_slope < 0:
-        volume_score -= 0.75
-
-    # Price-volume confirmation
-    if price_volume_sign > 0:
-        volume_score += 0.50
-    elif price_volume_sign < 0:
-        volume_score -= 0.50
-
-    if volume_score >= 1.25:
-        volume = "ACCUMULATION"
-    elif volume_score <= -1.0:
-        volume = "DISTRIBUTION"
+    if volume_score > 0:
+        volume = "EXPANDING"
+    elif volume_score < 0:
+        volume = "WEAK"
     else:
-        volume = "NEUTRAL"
+        volume = "NORMAL"
 
-    # -------------------------------------------------------------
-    # Return
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # ADX
+    # ---------------------------------------------------------------
+
+    adx = _latest_value(
+        features,
+        "adx",
+        0.0,
+    )
 
     return {
         "trend": trend,
         "momentum": momentum,
         "volume": volume,
-        "trend_score": round(float(trend_score), 3),
-        "momentum_score": round(float(momentum_score), 3),
-        "volume_score": round(float(volume_score), 3),
-        "adx": round(float(adx), 3),
+        "trend_score": float(trend_score),
+        "momentum_score": float(momentum_score),
+        "volume_score": float(volume_score),
+        "adx": float(adx),
     }
 
 
-# ---------------------------------------------------------------------
-# Signal
-# ---------------------------------------------------------------------
+# =====================================================================
+# TRADE PLAN
+# =====================================================================
+
+
+def _build_trade_plan(
+    current_price: float,
+    signal: str,
+    stop_loss_pct: float,
+    target_pct: float,
+) -> Dict[str, Any]:
+
+    if current_price <= 0:
+        return {
+            "entry": None,
+            "stop_loss": None,
+            "target": None,
+            "risk_percent": stop_loss_pct * 100,
+            "reward_percent": target_pct * 100,
+            "risk_reward": (
+                target_pct / stop_loss_pct
+                if stop_loss_pct > 0
+                else 0.0
+            ),
+        }
+
+    entry = current_price
+
+    if signal == "BUY":
+        stop_loss = entry * (
+            1.0 - stop_loss_pct
+        )
+
+        target = entry * (
+            1.0 + target_pct
+        )
+
+    elif signal == "SELL":
+        stop_loss = entry * (
+            1.0 + stop_loss_pct
+        )
+
+        target = entry * (
+            1.0 - target_pct
+        )
+
+    else:
+        stop_loss = None
+        target = None
+
+    return {
+        "entry": float(entry),
+        "stop_loss": (
+            float(stop_loss)
+            if stop_loss is not None
+            else None
+        ),
+        "target": (
+            float(target)
+            if target is not None
+            else None
+        ),
+        "risk_percent": float(
+            stop_loss_pct * 100
+        ),
+        "reward_percent": float(
+            target_pct * 100
+        ),
+        "risk_reward": float(
+            target_pct / stop_loss_pct
+            if stop_loss_pct > 0
+            else 0.0
+        ),
+    }
+
+
+# =====================================================================
+# SIGNAL ENGINE
+# =====================================================================
+
 
 def _generate_signal(
     probability_up: float,
-    alignment: float,
     threshold: float,
 ) -> str:
+    """
+    Convert probability into BUY / SELL / WAIT.
 
-    probability_up = _safe_float(probability_up, 0.5)
-    alignment = _safe_float(alignment, 0.0)
+    The region between:
+        1 - threshold
+    and:
+        threshold
 
-    if probability_up >= threshold and alignment >= 0:
+    is intentionally treated as WAIT.
+    """
+
+    probability_up = _safe_float(
+        probability_up,
+        0.5,
+    )
+
+    threshold = min(
+        max(float(threshold), 0.50),
+        0.95,
+    )
+
+    lower_threshold = 1.0 - threshold
+
+    if probability_up >= threshold:
         return "BUY"
 
-    if probability_up <= (1.0 - threshold) and alignment <= 0:
+    if probability_up <= lower_threshold:
         return "SELL"
 
     return "WAIT"
 
 
-# ---------------------------------------------------------------------
-# Trade Plan
-# ---------------------------------------------------------------------
+# =====================================================================
+# MAIN ANALYZER
+# =====================================================================
 
-def _create_trade_plan(
-    price: float,
-    signal: str,
-    stop_loss_pct: float,
-    target_pct: float,
-) -> Dict[str, Optional[float]]:
-
-    price = _safe_float(price)
-
-    if price <= 0:
-        return {
-            "entry": None,
-            "stop_loss": None,
-            "target": None,
-        }
-
-    if signal == "BUY":
-        return {
-            "entry": price,
-            "stop_loss": price * (1.0 - stop_loss_pct),
-            "target": price * (1.0 + target_pct),
-        }
-
-    if signal == "SELL":
-        return {
-            "entry": price,
-            "stop_loss": price * (1.0 + stop_loss_pct),
-            "target": price * (1.0 - target_pct),
-        }
-
-    return {
-        "entry": price,
-        "stop_loss": None,
-        "target": None,
-    }
-
-
-# ---------------------------------------------------------------------
-# Main Analyzer
-# ---------------------------------------------------------------------
 
 def analyze_stock(
     df: pd.DataFrame,
@@ -373,31 +407,47 @@ def analyze_stock(
     target_pct: float = 0.06,
 ) -> PredictionResult:
 
-    if df is None or df.empty:
-        raise ValueError("Input stock data is empty.")
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError(
+            "df must be a pandas DataFrame."
+        )
+
+    if df.empty:
+        raise ValueError(
+            "Input DataFrame is empty."
+        )
 
     horizon = int(horizon)
 
-    if horizon <= 0:
-        raise ValueError("Prediction horizon must be greater than zero.")
+    if horizon < 1:
+        raise ValueError(
+            "Prediction horizon must be >= 1."
+        )
+
+    probability_threshold = float(
+        probability_threshold
+    )
 
     if not 0.50 <= probability_threshold < 1.0:
         raise ValueError(
-            "Probability threshold must be between 0.50 and 1.00."
+            "Probability threshold must be between "
+            "0.50 and 0.99."
         )
 
-    # -------------------------------------------------------------
-    # Feature engineering
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # FEATURE ENGINEERING
+    # ---------------------------------------------------------------
 
     features = build_features(df)
 
     if features is None or features.empty:
-        raise ValueError("Feature engineering returned no data.")
+        raise ValueError(
+            "Feature engineering produced no data."
+        )
 
-    # -------------------------------------------------------------
-    # Train model
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # ENSEMBLE
+    # ---------------------------------------------------------------
 
     model = SwingClassifier(
         horizon=horizon,
@@ -406,275 +456,469 @@ def analyze_stock(
 
     model.fit(features)
 
-    # -------------------------------------------------------------
-    # Prediction
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # LATEST PREDICTION
+    # ---------------------------------------------------------------
 
-    probabilities = model.predict_proba(features)
+    probabilities = model.predict_proba(
+        features
+    )
 
-    if probabilities is None:
-        raise ValueError("Model did not return probabilities.")
-
-    probabilities = np.asarray(probabilities)
-
-    if probabilities.ndim != 2 or probabilities.shape[1] < 2:
+    if len(probabilities) == 0:
         raise ValueError(
-            "Unexpected probability output from classifier."
+            "The model produced no prediction."
         )
 
-    latest_probability_down = _safe_float(
+    probability_down = _safe_float(
         probabilities[-1, 0],
         0.5,
     )
 
-    latest_probability_up = _safe_float(
+    probability_up = _safe_float(
         probabilities[-1, 1],
         0.5,
     )
 
-    # -------------------------------------------------------------
-    # Regime
-    # -------------------------------------------------------------
+    # Normalize in case of tiny floating-point error.
+    probability_sum = (
+        probability_up
+        + probability_down
+    )
+
+    if probability_sum > 0:
+        probability_up /= probability_sum
+        probability_down /= probability_sum
+
+    confidence = abs(
+        probability_up
+        - probability_down
+    )
+
+    uncertainty = 1.0 - confidence
+
+    signal = _generate_signal(
+        probability_up,
+        probability_threshold,
+    )
+
+    # ---------------------------------------------------------------
+    # MARKET REGIME
+    # ---------------------------------------------------------------
 
     try:
-        regime = market_regime(features)
+        regime = market_regime(
+            features
+        )
     except Exception:
         regime = "UNKNOWN"
 
     if isinstance(regime, pd.Series):
-        regime = str(regime.iloc[-1])
-    elif isinstance(regime, (list, tuple, np.ndarray)):
-        regime = str(regime[-1]) if len(regime) else "UNKNOWN"
-    else:
-        regime = str(regime)
+        regime = (
+            str(regime.iloc[-1])
+            if len(regime)
+            else "UNKNOWN"
+        )
 
-    regime = regime.upper()
+    if isinstance(regime, pd.DataFrame):
+        if not regime.empty:
+            regime = str(
+                regime.iloc[-1, 0]
+            )
+        else:
+            regime = "UNKNOWN"
 
-    # -------------------------------------------------------------
-    # Higher timeframe information
-    # -------------------------------------------------------------
+    regime = str(regime)
+
+    # ---------------------------------------------------------------
+    # MULTI-TIMEFRAME
+    # ---------------------------------------------------------------
 
     weekly_trend = _latest_text(
         features,
-        [
-            "weekly_trend",
-            "weekly_direction",
-            "weekly_regime",
-        ],
+        "weekly_trend",
         "UNKNOWN",
     )
 
     monthly_trend = _latest_text(
         features,
-        [
-            "monthly_trend",
-            "monthly_direction",
-            "monthly_regime",
-        ],
+        "monthly_trend",
         "UNKNOWN",
     )
 
     higher_timeframe_score = _latest_value(
         features,
-        [
-            "higher_timeframe_score",
-            "mtf_score",
-        ],
+        "higher_timeframe_score",
         0.0,
     )
 
-    three_timeframe_alignment = _latest_value(
+    three_timeframe_alignment = _latest_text(
         features,
-        [
-            "three_timeframe_alignment",
-            "mtf_alignment",
-            "higher_timeframe_alignment",
-        ],
-        0.0,
+        "three_timeframe_alignment",
+        "UNKNOWN",
     )
 
-    # -------------------------------------------------------------
-    # Market Structure
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # MARKET STRUCTURE
+    # ---------------------------------------------------------------
 
-    market_structure = _calculate_market_structure(features)
-
-    trend = market_structure["trend"]
-    momentum = market_structure["momentum"]
-    volume = market_structure["volume"]
-
-    # -------------------------------------------------------------
-    # Final signal
-    # -------------------------------------------------------------
-
-    signal = _generate_signal(
-        latest_probability_up,
-        three_timeframe_alignment,
-        probability_threshold,
+    structure = _calculate_market_structure(
+        features
     )
 
-    # -------------------------------------------------------------
-    # Current price
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # TRADE PLAN
+    # ---------------------------------------------------------------
 
-    current_price = _latest_close(features)
-
-    # -------------------------------------------------------------
-    # Trade plan
-    # -------------------------------------------------------------
-
-    trade_plan = _create_trade_plan(
-        current_price,
-        signal,
-        float(stop_loss_pct),
-        float(target_pct),
+    current_price = _latest_close(
+        features
     )
 
-    # -------------------------------------------------------------
-    # Indicators
-    # -------------------------------------------------------------
+    trade_plan = _build_trade_plan(
+        current_price=current_price,
+        signal=signal,
+        stop_loss_pct=stop_loss_pct,
+        target_pct=target_pct,
+    )
 
-    indicator_names = [
-        "rsi14",
-        "macd",
-        "macd_signal",
-        "macd_hist",
-        "atr14",
-        "atr_pct",
-        "ema20",
-        "ema50",
-        "ema200",
-        "adx14",
-        "plus_di",
-        "minus_di",
-        "relative_volume",
-        "obv",
-        "roc10",
-        "roc20",
-    ]
-
-    indicators: Dict[str, float] = {}
-
-    for name in indicator_names:
-        if name in features.columns:
-            value = _safe_float(features[name].iloc[-1], np.nan)
-
-            if np.isfinite(value):
-                indicators[name] = value
-
-    # -------------------------------------------------------------
-    # Feature importance
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # MODEL AGREEMENT
+    # ---------------------------------------------------------------
 
     try:
-        feature_importance = model.feature_importance()
+        model_agreement = (
+            model.model_agreement(features)
+        )
+    except Exception:
+        model_agreement = {
+            "agreement": 0.0,
+            "disagreement": 1.0,
+            "bullish_models": 0,
+            "bearish_models": 0,
+            "total_models": 0,
+            "status": "UNKNOWN",
+        }
 
-        if isinstance(feature_importance, pd.DataFrame):
-            top_features = feature_importance.head(10)
-        elif isinstance(feature_importance, dict):
-            top_features = dict(
-                sorted(
-                    feature_importance.items(),
-                    key=lambda x: abs(_safe_float(x[1])),
-                    reverse=True,
-                )[:10]
+    try:
+        component_probabilities = (
+            model.component_probabilities(
+                features
             )
-        else:
-            top_features = feature_importance
-
+        )
     except Exception:
-        feature_importance = {}
-        top_features = {}
+        component_probabilities = {}
 
-    # -------------------------------------------------------------
-    # Model accuracy
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # CONFIDENCE
+    # ---------------------------------------------------------------
 
-    training_accuracy = _safe_float(
-        getattr(model, "training_accuracy", 0.0),
-        0.0,
+    confidence_metrics = (
+        model.confidence_metrics(
+            features
+        )
     )
 
-    # -------------------------------------------------------------
-    # Confidence
-    # -------------------------------------------------------------
-
-    confidence = abs(
-        latest_probability_up - latest_probability_down
-    )
-
-    # -------------------------------------------------------------
-    # Result
-    # -------------------------------------------------------------
-
-    result = PredictionResult()
-
-    result.signal = signal
-
-    result.probability_up = latest_probability_up
-    result.probability_down = latest_probability_down
-    result.prediction_probability = latest_probability_up
-    result.confidence = confidence
-
-    result.horizon = horizon
-
-    result.current_price = current_price
-    result.price = current_price
-
-    result.regime = regime
-
-    result.weekly_trend = weekly_trend
-    result.monthly_trend = monthly_trend
-
-    result.higher_timeframe_score = higher_timeframe_score
-    result.three_timeframe_alignment = three_timeframe_alignment
-
-    # Market Structure
-    result.market_structure = market_structure
-
-    # Direct compatibility attributes for the UI
-    result.trend = trend
-    result.momentum = momentum
-    result.volume = volume
-
-    result.trend_score = market_structure["trend_score"]
-    result.momentum_score = market_structure["momentum_score"]
-    result.volume_score = market_structure["volume_score"]
-
-    # Trade plan
-    result.trade_plan = trade_plan
-
-    result.entry = trade_plan.get("entry")
-    result.stop_loss = trade_plan.get("stop_loss")
-    result.target = trade_plan.get("target")
-
-    # Indicators
-    result.indicators = indicators
-
-    # Features / importance
-    result.top_features = top_features
-    result.feature_importance = feature_importance
-
-    # Model information
-    result.model_training_accuracy = training_accuracy
-    result.training_accuracy = training_accuracy
-
-    result.n_rows = int(len(features))
+    # ---------------------------------------------------------------
+    # FEATURE IMPORTANCE
+    # ---------------------------------------------------------------
 
     try:
-        result.n_features = int(len(model.feature_names_))
-    except Exception:
-        result.n_features = 0
+        importance_df = (
+            model.feature_importance()
+        )
 
-    result.features = features
-    result.model = model
+        top_features = (
+            importance_df
+            .head(10)
+            .to_dict("records")
+        )
+
+        feature_importance = (
+            importance_df.to_dict(
+                "records"
+            )
+        )
+
+    except Exception:
+        top_features = []
+        feature_importance = []
+
+    # ---------------------------------------------------------------
+    # MODEL SUMMARY
+    # ---------------------------------------------------------------
+
+    model_summary = model.summary()
+
+    validation_accuracy = (
+        model_summary.get(
+            "validation_accuracy"
+        )
+    )
+
+    validation_roc_auc = (
+        model_summary.get(
+            "validation_roc_auc"
+        )
+    )
+
+    validation_brier = (
+        model_summary.get(
+            "validation_brier"
+        )
+    )
+
+    # ---------------------------------------------------------------
+    # RESULT
+    # ---------------------------------------------------------------
+
+    result = PredictionResult(
+        {
+            "signal": signal,
+
+            "probability_up": float(
+                probability_up
+            ),
+
+            "probability_down": float(
+                probability_down
+            ),
+
+            # Explicit OOS naming.
+            #
+            # The classifier creates its target using future close.
+            # Therefore the latest row has no target and is not part
+            # of the fitted training observations.
+            "prediction_probability_oos": float(
+                probability_up
+            ),
+
+            # Backward compatibility.
+            "prediction_probability": float(
+                probability_up
+            ),
+
+            "confidence": float(
+                confidence
+            ),
+
+            "uncertainty": float(
+                uncertainty
+            ),
+
+            "horizon": int(
+                horizon
+            ),
+
+            "current_price": float(
+                current_price
+            ),
+
+            "price": float(
+                current_price
+            ),
+
+            # Market regime.
+            "regime": regime,
+
+            # Multi-timeframe.
+            "weekly_trend": weekly_trend,
+            "monthly_trend": monthly_trend,
+
+            "higher_timeframe_score": float(
+                higher_timeframe_score
+            ),
+
+            "three_timeframe_alignment": (
+                three_timeframe_alignment
+            ),
+
+            # Market structure.
+            "market_structure": structure,
+
+            "trend": structure[
+                "trend"
+            ],
+
+            "momentum": structure[
+                "momentum"
+            ],
+
+            "volume": structure[
+                "volume"
+            ],
+
+            "trend_score": structure[
+                "trend_score"
+            ],
+
+            "momentum_score": structure[
+                "momentum_score"
+            ],
+
+            "volume_score": structure[
+                "volume_score"
+            ],
+
+            # Trading plan.
+            "trade_plan": trade_plan,
+
+            "entry": trade_plan[
+                "entry"
+            ],
+
+            "stop_loss": trade_plan[
+                "stop_loss"
+            ],
+
+            "target": trade_plan[
+                "target"
+            ],
+
+            # Model agreement.
+            "model_agreement": model_agreement,
+
+            "component_probabilities": (
+                component_probabilities
+            ),
+
+            # Confidence diagnostics.
+            "confidence_metrics": (
+                confidence_metrics
+            ),
+
+            # Indicators.
+            "indicators": {
+                "rsi14": _latest_value(
+                    features,
+                    "rsi14",
+                    np.nan,
+                ),
+                "macd": _latest_value(
+                    features,
+                    "macd",
+                    np.nan,
+                ),
+                "macd_signal": _latest_value(
+                    features,
+                    "macd_signal",
+                    np.nan,
+                ),
+                "macd_hist": _latest_value(
+                    features,
+                    "macd_hist",
+                    np.nan,
+                ),
+                "atr14": _latest_value(
+                    features,
+                    "atr14",
+                    np.nan,
+                ),
+                "atr_pct": _latest_value(
+                    features,
+                    "atr_pct",
+                    np.nan,
+                ),
+                "ema20": _latest_value(
+                    features,
+                    "ema20",
+                    np.nan,
+                ),
+                "ema50": _latest_value(
+                    features,
+                    "ema50",
+                    np.nan,
+                ),
+                "ema200": _latest_value(
+                    features,
+                    "ema200",
+                    np.nan,
+                ),
+                "relative_volume": _latest_value(
+                    features,
+                    "relative_volume",
+                    np.nan,
+                ),
+                "adx": _latest_value(
+                    features,
+                    "adx",
+                    np.nan,
+                ),
+            },
+
+            # ML diagnostics.
+            "top_features": top_features,
+
+            "feature_importance": (
+                feature_importance
+            ),
+
+            "model_training_accuracy": (
+                model_summary.get(
+                    "training_accuracy"
+                )
+            ),
+
+            "training_accuracy": (
+                model_summary.get(
+                    "training_accuracy"
+                )
+            ),
+
+            "validation_accuracy": (
+                validation_accuracy
+            ),
+
+            "validation_precision": (
+                model_summary.get(
+                    "validation_precision"
+                )
+            ),
+
+            "validation_recall": (
+                model_summary.get(
+                    "validation_recall"
+                )
+            ),
+
+            "validation_f1": (
+                model_summary.get(
+                    "validation_f1"
+                )
+            ),
+
+            "validation_roc_auc": (
+                validation_roc_auc
+            ),
+
+            "validation_brier": (
+                validation_brier
+            ),
+
+            "model_summary": model_summary,
+
+            # Dataset diagnostics.
+            "n_rows": int(
+                len(features)
+            ),
+
+            "n_features": int(
+                len(
+                    model.feature_names_
+                )
+            ),
+
+            "features": features,
+
+            "model": model,
+        }
+    )
 
     return result
 
 
-# ---------------------------------------------------------------------
-# Compatibility alias
-# ---------------------------------------------------------------------
+# =====================================================================
+# BACKWARD COMPATIBILITY
+# =====================================================================
+
 
 predict_stock = analyze_stock
 
