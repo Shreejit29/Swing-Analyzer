@@ -1,21 +1,31 @@
 """
-Calibrated Ensemble Swing Trading Classifier
+Ensemble Swing Trading Classifier
 
 Models:
-- Gradient Boosting
-- Random Forest
-- Extra Trees
-- HistGradientBoosting
-- Logistic Regression
+    - Gradient Boosting
+    - Random Forest
+    - Extra Trees
+    - HistGradientBoosting
+    - Logistic Regression
 
-Features:
-- Soft probability voting
-- Time-series-aware probability calibration
-- Chronological validation
-- Model agreement / disagreement
-- Confidence and uncertainty metrics
-- Aggregated feature importance
-- Backward-compatible SwingClassifier API
+Architecture:
+    OHLCV/features
+        ↓
+    chronological target
+        ↓
+    chronological validation
+        ↓
+    soft-voting ensemble
+        ↓
+    probability calibration
+        ↓
+    final probability
+        ↓
+    BUY / SELL / WAIT
+
+Important:
+The final `horizon` rows are excluded from training because their
+future outcome is not yet known.
 """
 
 from __future__ import annotations
@@ -25,7 +35,6 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import (
     ExtraTreesClassifier,
     GradientBoostingClassifier,
@@ -33,25 +42,33 @@ from sklearn.ensemble import (
     RandomForestClassifier,
     VotingClassifier,
 )
+
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
+
+from sklearn.linear_model import (
+    LogisticRegression,
+)
+
 from sklearn.metrics import (
     accuracy_score,
-    brier_score_loss,
-    f1_score,
     precision_score,
     recall_score,
+    f1_score,
     roc_auc_score,
+    brier_score_loss,
 )
+
 from sklearn.pipeline import Pipeline
-from sklearn.model_selection import TimeSeriesSplit
 
 
-class GradientBoostingSwingClassifier:
+# =====================================================================
+# CLASS
+# =====================================================================
+
+
+class EnsembleSwingClassifier:
     """
-    Backward-compatible class name.
-
-    Internally this is a calibrated probability-based ensemble.
+    Diverse soft-voting ensemble for swing-direction prediction.
     """
 
     def __init__(
@@ -60,199 +77,281 @@ class GradientBoostingSwingClassifier:
         probability_threshold: float = 0.60,
         random_state: int = 42,
         min_samples: int = 80,
+        validation_fraction: float = 0.20,
         **kwargs: Any,
     ):
-        self.horizon = int(horizon)
-        self.probability_threshold = float(probability_threshold)
-        self.random_state = int(random_state)
-        self.min_samples = int(min_samples)
 
-        self.feature_names_: list[str] = []
+        self.horizon = int(
+            horizon
+        )
 
-        self.model_ = None
-        self.base_model_ = None
+        self.probability_threshold = float(
+            probability_threshold
+        )
+
+        self.random_state = int(
+            random_state
+        )
+
+        self.min_samples = int(
+            min_samples
+        )
+
+        self.validation_fraction = float(
+            validation_fraction
+        )
+
+        self.model = None
+
+        self.feature_names_ = []
+
         self.is_fitted = False
 
-        self.training_accuracy: Optional[float] = None
+        self.training_accuracy = None
 
-        self.validation_accuracy: Optional[float] = None
-        self.validation_precision: Optional[float] = None
-        self.validation_recall: Optional[float] = None
-        self.validation_f1: Optional[float] = None
-        self.validation_roc_auc: Optional[float] = None
-        self.validation_brier: Optional[float] = None
+        self.validation_accuracy = None
+        self.validation_precision = None
+        self.validation_recall = None
+        self.validation_f1 = None
+        self.validation_roc_auc = None
+        self.validation_brier = None
 
-        self.n_training_samples = 0
-        self.n_validation_samples = 0
+        self.validation_predictions_ = None
+        self.validation_probabilities_ = None
+        self.validation_actual_ = None
 
-        self.component_names = [
-            "Gradient Boosting",
-            "Random Forest",
-            "Extra Trees",
-            "Histogram Gradient Boosting",
-            "Logistic Regression",
+        self.model_component_names_ = []
+
+        self.component_weights_ = {}
+
+        self.calibration_enabled = False
+
+        self.calibration_a_ = 1.0
+        self.calibration_b_ = 0.0
+
+
+    # =================================================================
+    # FEATURE CLEANING
+    # =================================================================
+
+
+    def _clean_features(
+        self,
+        df: pd.DataFrame,
+    ) -> pd.DataFrame:
+
+        if not isinstance(
+            df,
+            pd.DataFrame,
+        ):
+
+            raise TypeError(
+                "Input must be a pandas DataFrame."
+            )
+
+        data = df.copy()
+
+        # Remove duplicate columns.
+        data = data.loc[
+            :,
+            ~data.columns.duplicated(
+                keep="first"
+            ),
         ]
 
-    # ================================================================
-    # DATA PREPARATION
-    # ================================================================
+        # Convert column names to strings.
+        data.columns = [
+            str(c)
+            for c in data.columns
+        ]
 
-    @staticmethod
-    def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
-        out = df.copy()
-
-        if isinstance(out.columns, pd.MultiIndex):
-            out.columns = [
-                "_".join(
-                    str(part).strip()
-                    for part in col
-                    if str(part).strip().lower() != "nan"
-                ).strip("_")
-                for col in out.columns
-            ]
-
-        out.columns = [str(c).strip() for c in out.columns]
-
-        return out
-
-    @staticmethod
-    def _numeric_features(df: pd.DataFrame) -> pd.DataFrame:
-        out = df.copy()
-        out = GradientBoostingSwingClassifier._flatten_columns(out)
-
-        leakage_keywords = {
+        # Columns that must never be model inputs.
+        forbidden = {
             "open",
             "high",
             "low",
             "close",
             "volume",
+            "adj_close",
             "target",
             "future",
-            "label",
+            "future_close",
             "date",
             "datetime",
-            "timestamp",
             "time",
         }
 
-        keep = []
+        keep_columns = []
 
-        for col in out.columns:
-            name = str(col).strip().lower()
+        for column in data.columns:
 
-            if name in leakage_keywords:
+            lower = column.lower().strip()
+
+            if lower in forbidden:
                 continue
 
-            if (
-                name.startswith("future_")
-                or name.startswith("target_")
-                or name.startswith("label_")
+            if lower.startswith(
+                "future_"
             ):
                 continue
 
-            keep.append(col)
+            if lower.startswith(
+                "target_"
+            ):
+                continue
 
-        out = out[keep]
+            keep_columns.append(
+                column
+            )
 
-        for col in out.columns:
-            if not pd.api.types.is_numeric_dtype(out[col]):
-                out[col] = pd.to_numeric(
-                    out[col],
-                    errors="coerce",
-                )
+        data = data[
+            keep_columns
+        ]
 
-        out = out.select_dtypes(include=[np.number])
+        # Numeric features only.
+        data = data.select_dtypes(
+            include=[
+                np.number
+            ]
+        )
 
-        out = out.replace(
+        # Replace invalid values.
+        data = data.replace(
             [np.inf, -np.inf],
             np.nan,
         )
 
-        return out
+        return data
 
-    def _prepare_training_data(
+
+    # =================================================================
+    # TARGET
+    # =================================================================
+
+
+    def _create_target(
         self,
         df: pd.DataFrame,
     ):
-        if not isinstance(df, pd.DataFrame):
-            raise TypeError(
-                "Input must be a pandas DataFrame."
-            )
 
-        data = self._flatten_columns(df)
+        if "close" not in df.columns:
 
-        close_candidates = [
-            c
-            for c in data.columns
-            if str(c).strip().lower() == "close"
-        ]
-
-        if not close_candidates:
             raise ValueError(
-                "A 'close' column is required."
+                "Input data must contain "
+                "'close' for target creation."
             )
 
         close = pd.to_numeric(
-            data[close_candidates[0]],
+            df["close"],
             errors="coerce",
         )
 
-        future_close = close.shift(-self.horizon)
-
-        valid_target = (
-            future_close.notna()
-            & close.notna()
+        future_close = (
+            close.shift(
+                -self.horizon
+            )
         )
 
-        y = (
-            future_close[valid_target]
-            > close[valid_target]
-        ).astype(int)
+        target = (
+            future_close
+            > close
+        ).astype(float)
 
-        X_raw = data.loc[valid_target].copy()
+        valid = (
+            close.notna()
+            & future_close.notna()
+        )
 
-        X = self._numeric_features(X_raw)
+        return (
+            target.loc[valid].astype(int),
+            valid,
+        )
 
-        if X.empty:
+
+    # =================================================================
+    # BUILD DATASET
+    # =================================================================
+
+
+    def _prepare_dataset(
+        self,
+        df: pd.DataFrame,
+    ):
+
+        target, valid = (
+            self._create_target(df)
+        )
+
+        features = self._clean_features(
+            df
+        )
+
+        features = features.loc[
+            valid
+        ]
+
+        target = target.loc[
+            features.index
+        ]
+
+        if len(features) < self.min_samples:
+
             raise ValueError(
-                "No usable numeric model features were found."
+                "Not enough valid observations "
+                f"for training. Need at least "
+                f"{self.min_samples}, got "
+                f"{len(features)}."
             )
 
-        X = X.loc[y.index]
+        if target.nunique() < 2:
 
-        valid_features = ~X.isna().all(axis=1)
-
-        X = X.loc[valid_features]
-        y = y.loc[valid_features]
-
-        if len(X) < self.min_samples:
             raise ValueError(
-                f"Not enough training samples. "
-                f"Need at least {self.min_samples}, "
-                f"got {len(X)}."
+                "Training target contains only "
+                "one class."
             )
 
-        if y.nunique() < 2:
-            raise ValueError(
-                "Training target contains only one class."
+        # Remove columns containing no usable data.
+        all_nan = [
+            column
+            for column in features.columns
+            if features[column].notna().sum() == 0
+        ]
+
+        if all_nan:
+
+            features = features.drop(
+                columns=all_nan
             )
 
-        return X, y
+        if features.empty:
 
-    # ================================================================
-    # BASE MODELS
-    # ================================================================
+            raise ValueError(
+                "No numeric model features available."
+            )
 
-    def _build_model(self):
+        return (
+            features,
+            target,
+        )
+
+
+    # =================================================================
+    # MODEL FACTORIES
+    # =================================================================
+
+
+    def _make_models(self):
+
+        imputer = SimpleImputer(
+            strategy="median",
+            add_indicator=True,
+        )
 
         gradient_boosting = Pipeline(
             [
                 (
                     "imputer",
-                    SimpleImputer(
-                        strategy="median",
-                        add_indicator=True,
-                    ),
+                    imputer,
                 ),
                 (
                     "model",
@@ -263,7 +362,9 @@ class GradientBoostingSwingClassifier:
                         min_samples_split=10,
                         min_samples_leaf=5,
                         subsample=0.85,
-                        random_state=self.random_state,
+                        random_state=(
+                            self.random_state
+                        ),
                     ),
                 ),
             ]
@@ -286,8 +387,12 @@ class GradientBoostingSwingClassifier:
                         min_samples_split=10,
                         min_samples_leaf=5,
                         max_features="sqrt",
-                        class_weight="balanced_subsample",
-                        random_state=self.random_state,
+                        class_weight=(
+                            "balanced_subsample"
+                        ),
+                        random_state=(
+                            self.random_state
+                        ),
                         n_jobs=-1,
                     ),
                 ),
@@ -312,20 +417,21 @@ class GradientBoostingSwingClassifier:
                         min_samples_leaf=4,
                         max_features="sqrt",
                         class_weight="balanced",
-                        random_state=self.random_state,
+                        random_state=(
+                            self.random_state
+                        ),
                         n_jobs=-1,
                     ),
                 ),
             ]
         )
 
-        histogram_gradient_boosting = Pipeline(
+        hist_gradient_boosting = Pipeline(
             [
                 (
                     "imputer",
                     SimpleImputer(
                         strategy="median",
-                        add_indicator=True,
                     ),
                 ),
                 (
@@ -336,7 +442,9 @@ class GradientBoostingSwingClassifier:
                         max_leaf_nodes=15,
                         min_samples_leaf=10,
                         l2_regularization=1.0,
-                        random_state=self.random_state,
+                        random_state=(
+                            self.random_state
+                        ),
                     ),
                 ),
             ]
@@ -356,230 +464,471 @@ class GradientBoostingSwingClassifier:
                     LogisticRegression(
                         C=0.5,
                         max_iter=1500,
-                        class_weight="balanced",
-                        random_state=self.random_state,
+                        solver="lbfgs",
+                        random_state=(
+                            self.random_state
+                        ),
                     ),
                 ),
             ]
         )
 
-        return VotingClassifier(
-            estimators=[
-                ("gb", gradient_boosting),
-                ("rf", random_forest),
-                ("et", extra_trees),
-                ("hgb", histogram_gradient_boosting),
-                ("lr", logistic_regression),
-            ],
-            voting="soft",
-            weights=[
-                1.25,
-                1.00,
-                1.00,
-                1.15,
-                0.75,
-            ],
-            flatten_transform=True,
-            n_jobs=-1,
+        return [
+            (
+                "GradientBoosting",
+                gradient_boosting,
+            ),
+            (
+                "RandomForest",
+                random_forest,
+            ),
+            (
+                "ExtraTrees",
+                extra_trees,
+            ),
+            (
+                "HistGradientBoosting",
+                hist_gradient_boosting,
+            ),
+            (
+                "LogisticRegression",
+                logistic_regression,
+            ),
+        ]
+
+
+    # =================================================================
+    # CALIBRATION
+    # =================================================================
+
+
+    def _fit_calibration(
+        self,
+        raw_probability: np.ndarray,
+        y_true: np.ndarray,
+    ) -> None:
+        """
+        Fit simple logistic/Platt-style calibration.
+
+        Uses log-odds of the raw ensemble probability and fits a
+        one-dimensional logistic regression.
+
+        If calibration cannot be estimated reliably, identity
+        calibration is retained.
+        """
+
+        probability = np.asarray(
+            raw_probability,
+            dtype=float,
         )
 
-    # ================================================================
-    # CALIBRATION
-    # ================================================================
+        y = np.asarray(
+            y_true,
+            dtype=int,
+        )
 
-    def _build_calibrated_model(
-        self,
-        X_train: pd.DataFrame,
-        y_train: pd.Series,
-    ):
-        """
-        Calibrate the ensemble using chronological folds.
+        valid = (
+            np.isfinite(probability)
+            & np.isfinite(y)
+        )
 
-        Calibration is performed only when enough samples/classes
-        exist for TimeSeriesSplit.
-        """
+        probability = probability[
+            valid
+        ]
 
-        base_model = self._build_model()
+        y = y[
+            valid
+        ]
 
-        n_samples = len(X_train)
+        if (
+            len(probability) < 20
+            or len(np.unique(y)) < 2
+        ):
 
-        # Conservative number of folds.
-        if n_samples >= 120:
-            n_splits = 3
-        elif n_samples >= 80:
-            n_splits = 2
-        else:
-            return base_model
+            self.calibration_enabled = False
+
+            self.calibration_a_ = 1.0
+            self.calibration_b_ = 0.0
+
+            return
+
+        probability = np.clip(
+            probability,
+            1e-6,
+            1.0 - 1e-6,
+        )
+
+        logit = np.log(
+            probability
+            / (
+                1.0
+                - probability
+            )
+        ).reshape(
+            -1,
+            1,
+        )
+
+        calibrator = LogisticRegression(
+            C=1.0,
+            max_iter=1000,
+        )
 
         try:
-            tscv = TimeSeriesSplit(
-                n_splits=n_splits
+
+            calibrator.fit(
+                logit,
+                y,
             )
 
-            calibrated = CalibratedClassifierCV(
-                estimator=base_model,
-                method="sigmoid",
-                cv=tscv,
-                n_jobs=-1,
+            self.calibration_a_ = float(
+                calibrator.coef_[0][0]
             )
 
-            calibrated.fit(
-                X_train,
-                y_train,
+            self.calibration_b_ = float(
+                calibrator.intercept_[0]
             )
 
-            return calibrated
+            self.calibration_enabled = True
 
         except Exception:
-            # Calibration must never make the application unusable.
-            base_model.fit(
-                X_train,
-                y_train,
+
+            self.calibration_enabled = False
+
+            self.calibration_a_ = 1.0
+            self.calibration_b_ = 0.0
+
+
+    def _calibrate_probability(
+        self,
+        probability: float,
+    ) -> float:
+
+        probability = float(
+            np.clip(
+                probability,
+                1e-6,
+                1.0 - 1e-6,
             )
+        )
 
-            return base_model
+        if not self.calibration_enabled:
 
-    # ================================================================
+            return probability
+
+        logit = np.log(
+            probability
+            / (
+                1.0
+                - probability
+            )
+        )
+
+        calibrated_logit = (
+            self.calibration_a_
+            * logit
+            + self.calibration_b_
+        )
+
+        calibrated = (
+            1.0
+            / (
+                1.0
+                + np.exp(
+                    -np.clip(
+                        calibrated_logit,
+                        -30,
+                        30,
+                    )
+                )
+            )
+        )
+
+        return float(
+            np.clip(
+                calibrated,
+                0.0,
+                1.0,
+            )
+        )
+
+
+    # =================================================================
     # FIT
-    # ================================================================
+    # =================================================================
 
-    def fit(self, df: pd.DataFrame):
 
-        X, y = self._prepare_training_data(df)
+    def fit(
+        self,
+        df: pd.DataFrame,
+    ):
 
-        self.feature_names_ = list(X.columns)
+        features, target = (
+            self._prepare_dataset(df)
+        )
+
+        self.feature_names_ = list(
+            features.columns
+        )
+
+        X = features
+        y = target
 
         n = len(X)
 
         validation_size = max(
             20,
-            int(n * 0.20),
+            int(
+                n
+                * self.validation_fraction
+            ),
         )
 
-        if n - validation_size < self.min_samples:
-            validation_size = max(
-                10,
-                n - self.min_samples,
-            )
+        # Never allow validation to consume
+        # the complete training dataset.
+        validation_size = min(
+            validation_size,
+            n - max(
+                self.min_samples // 2,
+                40,
+            ),
+        )
 
-        split_index = n - validation_size
+        if validation_size < 10:
 
-        if split_index <= 0:
-            raise ValueError(
-                "Insufficient data for validation."
-            )
+            validation_size = 10
 
-        X_train = X.iloc[:split_index].copy()
-        y_train = y.iloc[:split_index].copy()
+        split = (
+            n
+            - validation_size
+        )
 
-        X_valid = X.iloc[split_index:].copy()
-        y_valid = y.iloc[split_index:].copy()
+        X_train = X.iloc[
+            :split
+        ]
+
+        y_train = y.iloc[
+            :split
+        ]
+
+        X_validation = X.iloc[
+            split:
+        ]
+
+        y_validation = y.iloc[
+            split:
+        ]
 
         if y_train.nunique() < 2:
+
             raise ValueError(
-                "Training portion contains only one class."
+                "Training portion contains only "
+                "one target class."
             )
 
-        # ------------------------------------------------------------
-        # VALIDATION MODEL
-        # ------------------------------------------------------------
+        if y_validation.nunique() < 2:
 
-        validation_model = self._build_calibrated_model(
+            # Validation still proceeds for predictions,
+            # but ROC-AUC may be unavailable.
+            pass
+
+        # =============================================================
+        # VALIDATION ENSEMBLE
+        # =============================================================
+
+        validation_models = self._make_models()
+
+        validation_ensemble = VotingClassifier(
+            estimators=validation_models,
+            voting="soft",
+            weights=[
+                1.20,
+                1.00,
+                1.00,
+                1.10,
+                0.80,
+            ],
+            flatten_transform=True,
+        )
+
+        validation_ensemble.fit(
             X_train,
             y_train,
         )
 
-        valid_probability = (
-            validation_model
-            .predict_proba(X_valid)[:, 1]
+        raw_validation_probability = (
+            validation_ensemble
+            .predict_proba(
+                X_validation
+            )[:, 1]
         )
 
-        valid_prediction = (
-            valid_probability
+        validation_prediction = (
+            raw_validation_probability
             >= self.probability_threshold
         ).astype(int)
 
+        # =============================================================
+        # CALIBRATION
+        # =============================================================
+
+        self._fit_calibration(
+            raw_validation_probability,
+            y_validation.to_numpy(),
+        )
+
+        calibrated_validation_probability = (
+            np.array(
+                [
+                    self._calibrate_probability(
+                        p
+                    )
+                    for p in raw_validation_probability
+                ]
+            )
+        )
+
+        calibrated_validation_prediction = (
+            calibrated_validation_probability
+            >= self.probability_threshold
+        ).astype(int)
+
+        # =============================================================
+        # VALIDATION METRICS
+        # =============================================================
+
+        self.validation_actual_ = (
+            y_validation.to_numpy()
+        )
+
+        self.validation_probabilities_ = (
+            calibrated_validation_probability
+        )
+
+        self.validation_predictions_ = (
+            calibrated_validation_prediction
+        )
+
         self.validation_accuracy = float(
             accuracy_score(
-                y_valid,
-                valid_prediction,
+                y_validation,
+                calibrated_validation_prediction,
             )
         )
 
         self.validation_precision = float(
             precision_score(
-                y_valid,
-                valid_prediction,
+                y_validation,
+                calibrated_validation_prediction,
                 zero_division=0,
             )
         )
 
         self.validation_recall = float(
             recall_score(
-                y_valid,
-                valid_prediction,
+                y_validation,
+                calibrated_validation_prediction,
                 zero_division=0,
             )
         )
 
         self.validation_f1 = float(
             f1_score(
-                y_valid,
-                valid_prediction,
+                y_validation,
+                calibrated_validation_prediction,
                 zero_division=0,
             )
         )
 
-        if y_valid.nunique() >= 2:
-            self.validation_roc_auc = float(
-                roc_auc_score(
-                    y_valid,
-                    valid_probability,
+        if y_validation.nunique() >= 2:
+
+            try:
+
+                self.validation_roc_auc = float(
+                    roc_auc_score(
+                        y_validation,
+                        calibrated_validation_probability,
+                    )
                 )
-            )
+
+            except Exception:
+
+                self.validation_roc_auc = None
+
         else:
+
             self.validation_roc_auc = None
 
-        self.validation_brier = float(
-            brier_score_loss(
-                y_valid,
-                valid_probability,
+        try:
+
+            self.validation_brier = float(
+                brier_score_loss(
+                    y_validation,
+                    calibrated_validation_probability,
+                )
             )
+
+        except Exception:
+
+            self.validation_brier = None
+
+        # =============================================================
+        # FINAL PRODUCTION ENSEMBLE
+        # =============================================================
+
+        final_models = self._make_models()
+
+        self.model_component_names_ = [
+            name
+            for name, _ in final_models
+        ]
+
+        self.component_weights_ = {
+            "GradientBoosting": 1.20,
+            "RandomForest": 1.00,
+            "ExtraTrees": 1.00,
+            "HistGradientBoosting": 1.10,
+            "LogisticRegression": 0.80,
+        }
+
+        self.model = VotingClassifier(
+            estimators=final_models,
+            voting="soft",
+            weights=[
+                1.20,
+                1.00,
+                1.00,
+                1.10,
+                0.80,
+            ],
+            flatten_transform=True,
         )
 
-        self.n_validation_samples = len(
-            X_valid
-        )
-
-        # ------------------------------------------------------------
-        # FINAL PRODUCTION MODEL
-        # ------------------------------------------------------------
-
-        self.base_model_ = self._build_model()
-
-        self.model_ = self._build_calibrated_model(
+        self.model.fit(
             X,
             y,
         )
 
-        # If calibration returned an uncalibrated model,
-        # it is already fitted.
-        self.n_training_samples = len(X)
+        # =============================================================
+        # TRAINING ACCURACY
+        # =============================================================
 
-        train_probability = (
-            self.model_
-            .predict_proba(X)[:, 1]
+        training_probability = (
+            self.model
+            .predict_proba(
+                X
+            )[:, 1]
         )
 
-        train_prediction = (
-            train_probability
+        training_prediction = (
+            training_probability
             >= self.probability_threshold
         ).astype(int)
 
         self.training_accuracy = float(
             accuracy_score(
                 y,
-                train_prediction,
+                training_prediction,
             )
         )
 
@@ -587,185 +936,111 @@ class GradientBoostingSwingClassifier:
 
         return self
 
-    # ================================================================
-    # PREDICTION FEATURES
-    # ================================================================
 
-    def _prepare_prediction_features(
+    # =================================================================
+    # ALIGN FEATURES
+    # =================================================================
+
+
+    def _align_features(
         self,
         df: pd.DataFrame,
     ) -> pd.DataFrame:
 
-        X = self._numeric_features(df)
-
-        if X.empty:
-            raise ValueError(
-                "No usable numeric features found."
-            )
-
-        for col in self.feature_names_:
-            if col not in X.columns:
-                X[col] = np.nan
-
-        X = X[self.feature_names_]
-
-        return X
-
-    # ================================================================
-    # PREDICTION
-    # ================================================================
-
-    def predict_proba(
-        self,
-        df: pd.DataFrame,
-    ) -> np.ndarray:
-
-        if (
-            not self.is_fitted
-            or self.model_ is None
-        ):
-            raise RuntimeError(
-                "Model is not fitted. "
-                "Call fit() first."
-            )
-
-        X = self._prepare_prediction_features(
+        data = self._clean_features(
             df
         )
 
-        return self.model_.predict_proba(X)
+        for column in self.feature_names_:
 
-    def predict(
-        self,
-        df: pd.DataFrame,
-    ) -> np.ndarray:
+            if column not in data.columns:
 
-        probabilities = self.predict_proba(df)
+                data[column] = np.nan
 
-        return (
-            probabilities[:, 1]
-            >= self.probability_threshold
-        ).astype(int)
+        data = data[
+            self.feature_names_
+        ]
 
-    def latest_probability(
-        self,
-        df: pd.DataFrame,
-    ) -> float:
+        return data
 
-        probabilities = self.predict_proba(df)
 
-        if len(probabilities) == 0:
-            return float("nan")
+    # =================================================================
+    # COMPONENT PROBABILITIES
+    # =================================================================
 
-        return float(
-            probabilities[-1, 1]
-        )
-
-    # ================================================================
-    # MODEL AGREEMENT
-    # ================================================================
 
     def component_probabilities(
         self,
         df: pd.DataFrame,
     ) -> Dict[str, float]:
 
-        if (
-            not self.is_fitted
-            or self.model_ is None
-        ):
+        if not self.is_fitted:
+
             raise RuntimeError(
                 "Model is not fitted."
             )
 
-        X = self._prepare_prediction_features(
+        X = self._align_features(
             df
         )
 
-        if len(X) == 0:
-            return {}
+        probabilities = {}
 
-        latest = X.iloc[[-1]]
+        try:
 
-        # CalibratedClassifierCV stores fitted
-        # calibrated classifiers rather than a direct
-        # named_estimators_ object.
-        if hasattr(
-            self.model_,
-            "calibrated_classifiers_",
-        ):
-            # Use the calibrated ensemble probability
-            # as the authoritative production probability.
-            probability = float(
-                self.model_
-                .predict_proba(latest)[0, 1]
+            named_estimators = (
+                self.model.named_estimators_
             )
 
-            return {
-                "Calibrated Ensemble": probability
-            }
+        except Exception:
 
-        result = {}
+            return probabilities
 
-        if hasattr(
-            self.model_,
-            "named_estimators_",
+        for name, estimator in (
+            named_estimators.items()
         ):
-            for (
-                name,
-                estimator,
-            ) in self.model_.named_estimators_.items():
 
-                try:
-                    p = estimator.predict_proba(
-                        latest
-                    )[0, 1]
+            try:
 
-                    result[name] = float(p)
+                probability = float(
+                    estimator.predict_proba(
+                        X
+                    )[-1, 1]
+                )
 
-                except Exception:
-                    result[name] = float("nan")
+                if np.isfinite(
+                    probability
+                ):
 
-        return result
+                    probabilities[
+                        name
+                    ] = probability
+
+            except Exception:
+
+                continue
+
+        return probabilities
+
+
+    # =================================================================
+    # MODEL AGREEMENT
+    # =================================================================
+
 
     def model_agreement(
         self,
         df: pd.DataFrame,
     ) -> Dict[str, Any]:
-        """
-        Calculate agreement between ensemble components.
 
-        Agreement:
-            fraction of models predicting the same direction.
-
-        Disagreement:
-            1 - agreement.
-
-        This is intended as a risk-control signal rather
-        than a guarantee of future performance.
-        """
-
-        probabilities = self.component_probabilities(
-            df
+        probabilities = (
+            self.component_probabilities(
+                df
+            )
         )
 
         if not probabilities:
-            return {
-                "agreement": 0.0,
-                "disagreement": 1.0,
-                "bullish_models": 0,
-                "bearish_models": 0,
-                "total_models": 0,
-                "status": "UNKNOWN",
-            }
 
-        values = [
-            p
-            for p in probabilities.values()
-            if np.isfinite(p)
-        ]
-
-        if not values:
             return {
                 "agreement": 0.0,
                 "disagreement": 1.0,
@@ -776,374 +1051,473 @@ class GradientBoostingSwingClassifier:
             }
 
         bullish = sum(
-            p >= 0.50
-            for p in values
+            probability >= 0.50
+            for probability
+            in probabilities.values()
         )
 
-        bearish = len(values) - bullish
+        bearish = (
+            len(probabilities)
+            - bullish
+        )
 
-        majority = max(
+        total = len(
+            probabilities
+        )
+
+        agreement = max(
             bullish,
             bearish,
+        ) / total
+
+        disagreement = (
+            1.0
+            - agreement
         )
 
-        agreement = majority / len(values)
-
         if agreement >= 0.80:
+
             status = "STRONG AGREEMENT"
+
         elif agreement >= 0.60:
+
             status = "MODERATE AGREEMENT"
+
         else:
+
             status = "HIGH DISAGREEMENT"
 
         return {
-            "agreement": float(agreement),
-            "disagreement": float(
-                1.0 - agreement
+            "agreement": float(
+                agreement
             ),
-            "bullish_models": int(bullish),
-            "bearish_models": int(bearish),
-            "total_models": len(values),
+            "disagreement": float(
+                disagreement
+            ),
+            "bullish_models": int(
+                bullish
+            ),
+            "bearish_models": int(
+                bearish
+            ),
+            "total_models": int(
+                total
+            ),
             "status": status,
         }
 
-    # ================================================================
-    # CONFIDENCE
-    # ================================================================
 
-    def confidence_metrics(
+    # =================================================================
+    # PREDICT PROBABILITY
+    # =================================================================
+
+
+    def predict_proba(
         self,
         df: pd.DataFrame,
-    ) -> Dict[str, float]:
+    ) -> np.ndarray:
 
-        p_up = self.latest_probability(df)
+        if not self.is_fitted:
 
-        if not np.isfinite(p_up):
-            return {
-                "probability_up": float("nan"),
-                "probability_down": float("nan"),
-                "confidence": float("nan"),
-                "uncertainty": float("nan"),
-            }
+            raise RuntimeError(
+                "Model must be fitted before prediction."
+            )
 
-        p_down = 1.0 - p_up
-
-        confidence = abs(
-            p_up - p_down
+        X = self._align_features(
+            df
         )
 
-        uncertainty = (
-            1.0 - confidence
+        raw = (
+            self.model
+            .predict_proba(
+                X
+            )[:, 1]
         )
 
-        return {
-            "probability_up": float(p_up),
-            "probability_down": float(p_down),
-            "confidence": float(confidence),
-            "uncertainty": float(uncertainty),
-        }
+        calibrated = np.array(
+            [
+                self._calibrate_probability(
+                    probability
+                )
+                for probability in raw
+            ]
+        )
 
-    # ================================================================
+        calibrated = np.clip(
+            calibrated,
+            0.0,
+            1.0,
+        )
+
+        return np.column_stack(
+            [
+                1.0 - calibrated,
+                calibrated,
+            ]
+        )
+
+
+    # =================================================================
+    # PREDICT
+    # =================================================================
+
+
+    def predict(
+        self,
+        df: pd.DataFrame,
+    ) -> np.ndarray:
+
+        probabilities = (
+            self.predict_proba(
+                df
+            )[:, 1]
+        )
+
+        return (
+            probabilities
+            >= self.probability_threshold
+        ).astype(int)
+
+
+    # =================================================================
+    # LATEST PROBABILITY
+    # =================================================================
+
+
+    def latest_probability(
+        self,
+        df: pd.DataFrame,
+    ) -> float:
+
+        probabilities = (
+            self.predict_proba(
+                df
+            )
+        )
+
+        if len(probabilities) == 0:
+
+            return 0.5
+
+        return float(
+            probabilities[-1, 1]
+        )
+
+
+    # =================================================================
     # FEATURE IMPORTANCE
-    # ================================================================
+    # =================================================================
+
 
     def feature_importance(
         self,
     ) -> pd.DataFrame:
 
-        if (
-            not self.is_fitted
-            or self.model_ is None
-        ):
-            return pd.DataFrame(
-                columns=[
-                    "feature",
-                    "importance",
-                ]
+        if not self.is_fitted:
+
+            raise RuntimeError(
+                "Model is not fitted."
             )
 
-        all_importances = []
+        importance_arrays = []
+        importance_weights = []
 
-        # ------------------------------------------------------------
-        # Direct VotingClassifier
-        # ------------------------------------------------------------
-
-        if hasattr(
-            self.model_,
-            "named_estimators_",
-        ):
-
-            for (
-                name,
-                pipeline,
-            ) in self.model_.named_estimators_.items():
-
-                try:
-                    model = pipeline.named_steps[
-                        "model"
-                    ]
-
-                    values = None
-
-                    if hasattr(
-                        model,
-                        "feature_importances_",
-                    ):
-                        values = np.asarray(
-                            model.feature_importances_,
-                            dtype=float,
-                        )
-
-                    elif hasattr(
-                        model,
-                        "coef_",
-                    ):
-                        coef = np.asarray(
-                            model.coef_,
-                            dtype=float,
-                        )
-
-                        values = np.mean(
-                            np.abs(coef),
-                            axis=0,
-                        )
-
-                    if values is None:
-                        continue
-
-                    if len(values) > len(
-                        self.feature_names_
-                    ):
-                        values = values[
-                            :len(self.feature_names_)
-                        ]
-
-                    if len(values) != len(
-                        self.feature_names_
-                    ):
-                        continue
-
-                    values = np.nan_to_num(
-                        values
-                    )
-
-                    total = values.sum()
-
-                    if total > 0:
-                        values = (
-                            values / total
-                        )
-
-                    all_importances.append(
-                        values
-                    )
-
-                except Exception:
-                    continue
-
-        # ------------------------------------------------------------
-        # CalibratedClassifierCV
-        # ------------------------------------------------------------
-
-        elif hasattr(
-            self.model_,
-            "calibrated_classifiers_",
-        ):
-
-            for calibrated_model in (
-                self.model_
-                .calibrated_classifiers_
-            ):
-
-                try:
-                    estimator = (
-                        calibrated_model
-                        .estimator
-                    )
-
-                    if not hasattr(
-                        estimator,
-                        "named_estimators_",
-                    ):
-                        continue
-
-                    for pipeline in (
-                        estimator
-                        .named_estimators_.values()
-                    ):
-
-                        model = (
-                            pipeline
-                            .named_steps[
-                                "model"
-                            ]
-                        )
-
-                        values = None
-
-                        if hasattr(
-                            model,
-                            "feature_importances_",
-                        ):
-                            values = np.asarray(
-                                model.feature_importances_,
-                                dtype=float,
-                            )
-
-                        elif hasattr(
-                            model,
-                            "coef_",
-                        ):
-                            coef = np.asarray(
-                                model.coef_,
-                                dtype=float,
-                            )
-
-                            values = np.mean(
-                                np.abs(coef),
-                                axis=0,
-                            )
-
-                        if values is None:
-                            continue
-
-                        if len(values) > len(
-                            self.feature_names_
-                        ):
-                            values = values[
-                                :len(
-                                    self.feature_names_
-                                )
-                            ]
-
-                        if len(values) != len(
-                            self.feature_names_
-                        ):
-                            continue
-
-                        values = np.nan_to_num(
-                            values
-                        )
-
-                        total = values.sum()
-
-                        if total > 0:
-                            values = (
-                                values / total
-                            )
-
-                        all_importances.append(
-                            values
-                        )
-
-                except Exception:
-                    continue
-
-        if not all_importances:
-            return pd.DataFrame(
-                columns=[
-                    "feature",
-                    "importance",
-                ]
-            )
-
-        importance = np.mean(
-            np.vstack(
-                all_importances
-            ),
-            axis=0,
+        named_estimators = (
+            self.model.named_estimators_
         )
 
-        total = importance.sum()
+        for name, estimator in (
+            named_estimators.items()
+        ):
+
+            try:
+
+                inner_model = (
+                    estimator.named_steps[
+                        "model"
+                    ]
+                )
+
+            except Exception:
+
+                inner_model = estimator
+
+            importance = None
+
+            # Tree-based models.
+            if hasattr(
+                inner_model,
+                "feature_importances_",
+            ):
+
+                importance = (
+                    np.asarray(
+                        inner_model.feature_importances_,
+                        dtype=float,
+                    )
+                )
+
+            # Logistic regression.
+            elif hasattr(
+                inner_model,
+                "coef_",
+            ):
+
+                coefficient = (
+                    np.asarray(
+                        inner_model.coef_,
+                        dtype=float,
+                    )
+                )
+
+                if coefficient.ndim == 2:
+
+                    importance = np.abs(
+                        coefficient[0]
+                    )
+
+                else:
+
+                    importance = np.abs(
+                        coefficient
+                    )
+
+            if importance is None:
+                continue
+
+            # Imputer indicators can create additional
+            # dimensions. Keep original feature dimension
+            # by averaging/truncating if necessary.
+            n_features = len(
+                self.feature_names_
+            )
+
+            if len(importance) > n_features:
+
+                importance = importance[
+                    :n_features
+                ]
+
+            elif len(importance) < n_features:
+
+                importance = np.pad(
+                    importance,
+                    (
+                        0,
+                        n_features
+                        - len(importance),
+                    ),
+                    constant_values=0.0,
+                )
+
+            weight = _safe_float(
+                self.component_weights_.get(
+                    name,
+                    1.0,
+                ),
+                1.0,
+            )
+
+            importance_arrays.append(
+                importance
+            )
+
+            importance_weights.append(
+                weight
+            )
+
+        if not importance_arrays:
+
+            return pd.DataFrame(
+                columns=[
+                    "feature",
+                    "importance",
+                ]
+            )
+
+        matrix = np.vstack(
+            importance_arrays
+        )
+
+        weights = np.asarray(
+            importance_weights,
+            dtype=float,
+        )
+
+        weighted = (
+            matrix
+            * weights.reshape(
+                -1,
+                1,
+            )
+        )
+
+        combined = (
+            weighted.sum(
+                axis=0
+            )
+            / max(
+                weights.sum(),
+                1e-12,
+            )
+        )
+
+        total = combined.sum()
 
         if total > 0:
-            importance = (
-                importance / total
+
+            combined = (
+                combined
+                / total
             )
 
         result = pd.DataFrame(
             {
-                "feature": self.feature_names_,
-                "importance": importance,
+                "feature": (
+                    self.feature_names_
+                ),
+                "importance": combined,
             }
         )
 
-        return (
-            result
-            .sort_values(
-                "importance",
-                ascending=False,
-            )
-            .reset_index(drop=True)
+        result = result.sort_values(
+            "importance",
+            ascending=False,
+        ).reset_index(
+            drop=True
         )
 
-    # ================================================================
-    # SUMMARY
-    # ================================================================
+        return result
 
-    def summary(self) -> Dict[str, Any]:
+
+    # =================================================================
+    # SUMMARY
+    # =================================================================
+
+
+    def summary(
+        self,
+    ) -> Dict[str, Any]:
 
         return {
-            "model": (
+            "model_name": (
                 "Calibrated Soft Voting Ensemble"
             ),
+
             "model_type": (
-                "Probability-based ensemble"
+                "Diverse Ensemble"
             ),
-            "components": self.component_names,
-            "horizon": self.horizon,
-            "probability_threshold": (
+
+            "components": (
+                list(
+                    self.model_component_names_
+                )
+            ),
+
+            "weights": (
+                dict(
+                    self.component_weights_
+                )
+            ),
+
+            "horizon": int(
+                self.horizon
+            ),
+
+            "probability_threshold": float(
                 self.probability_threshold
             ),
-            "n_features": len(
-                self.feature_names_
-            ),
-            "n_training_samples": (
-                self.n_training_samples
-            ),
-            "n_validation_samples": (
-                self.n_validation_samples
-            ),
+
             "training_accuracy": (
                 self.training_accuracy
             ),
+
             "validation_accuracy": (
                 self.validation_accuracy
             ),
+
             "validation_precision": (
                 self.validation_precision
             ),
+
             "validation_recall": (
                 self.validation_recall
             ),
+
             "validation_f1": (
                 self.validation_f1
             ),
+
             "validation_roc_auc": (
                 self.validation_roc_auc
             ),
+
             "validation_brier": (
                 self.validation_brier
             ),
-            "is_fitted": self.is_fitted,
+
+            "calibration_enabled": bool(
+                self.calibration_enabled
+            ),
+
+            "n_features": int(
+                len(
+                    self.feature_names_
+                )
+            ),
+
+            "n_components": int(
+                len(
+                    self.model_component_names_
+                )
+            ),
+
+            "is_fitted": bool(
+                self.is_fitted
+            ),
         }
 
 
-# ================================================================
-# BACKWARD COMPATIBILITY
-# ================================================================
+# =====================================================================
+# COMPATIBILITY ALIASES
+# =====================================================================
 
-EnsembleSwingClassifier = (
-    GradientBoostingSwingClassifier
+
+GradientBoostingSwingClassifier = (
+    EnsembleSwingClassifier
 )
 
 SwingClassifier = (
-    GradientBoostingSwingClassifier
+    EnsembleSwingClassifier
 )
 
 
+# =====================================================================
+# INTERNAL HELPER
+# =====================================================================
+
+
+def _safe_float(
+    value: Any,
+    default: float = 0.0,
+) -> float:
+
+    try:
+
+        result = float(value)
+
+        if np.isfinite(result):
+
+            return result
+
+    except Exception:
+        pass
+
+    return float(default)
+
+
 __all__ = [
-    "GradientBoostingSwingClassifier",
     "EnsembleSwingClassifier",
+    "GradientBoostingSwingClassifier",
     "SwingClassifier",
 ]
