@@ -1184,6 +1184,292 @@ def _build_trade_plan(
 # =====================================================================
 
 
+
+# ================================================================
+# ADAPTIVE CONFIDENCE & EVIDENCE ENGINE
+# ================================================================
+
+def _bounded(value, low=0.0, high=1.0, default=0.5):
+    """Return a finite value bounded to [low, high]."""
+    try:
+        value = float(value)
+        if not np.isfinite(value):
+            return default
+        return float(np.clip(value, low, high))
+    except Exception:
+        return default
+
+
+def _trend_polarity(value):
+    """Map common trend labels to bullish/neutral/bearish polarity."""
+    text = str(value).upper()
+
+    if "STRONG BULL" in text or "BULLISH" in text or text == "BULL":
+        return 1.0
+    if "STRONG BEAR" in text or "BEARISH" in text or text == "BEAR":
+        return -1.0
+    if "SIDEWAYS" in text or "NEUTRAL" in text:
+        return 0.0
+
+    return 0.0
+
+
+def _context_score(context):
+    if not isinstance(context, dict):
+        return 0.0
+
+    for key in ("score", "strength", "trend_score"):
+        if key in context:
+            try:
+                value = float(context[key])
+                if np.isfinite(value):
+                    return float(np.clip(value, -1.0, 1.0))
+            except Exception:
+                pass
+
+    for key in ("trend", "summary", "regime"):
+        if key in context:
+            return _trend_polarity(context[key])
+
+    return 0.0
+
+
+def _extract_reliability_summary(model):
+    """Read calibration evidence without inventing missing validation data."""
+    summary = {
+        "available": False,
+        "validation_samples": 0,
+        "high_confidence_samples": 0,
+        "high_confidence_accuracy": np.nan,
+        "ece": np.nan,
+    }
+
+    try:
+        probabilities = np.asarray(
+            getattr(model, "validation_probabilities", []),
+            dtype=float,
+        ).reshape(-1)
+
+        actual = np.asarray(
+            getattr(model, "validation_actuals", []),
+            dtype=float,
+        ).reshape(-1)
+
+        if len(probabilities) == 0 or len(actual) != len(probabilities):
+            return summary
+
+        probabilities = np.clip(probabilities, 0.0, 1.0)
+        actual = np.asarray(actual, dtype=int)
+
+        confidence = np.maximum(probabilities, 1.0 - probabilities)
+        predicted = (probabilities >= 0.5).astype(int)
+
+        valid = np.isfinite(confidence) & np.isfinite(actual)
+        confidence = confidence[valid]
+        predicted = predicted[valid]
+        actual = actual[valid]
+
+        if len(actual) == 0:
+            return summary
+
+        summary["available"] = True
+        summary["validation_samples"] = int(len(actual))
+
+        high = confidence >= 0.90
+        summary["high_confidence_samples"] = int(high.sum())
+
+        if high.any():
+            summary["high_confidence_accuracy"] = float(
+                np.mean(predicted[high] == actual[high])
+            )
+
+        # Expected Calibration Error using 10 confidence bins.
+        edges = np.linspace(0.50, 1.00, 11)
+        ece = 0.0
+
+        for left, right in zip(edges[:-1], edges[1:]):
+            if right >= 1.0:
+                mask = (confidence >= left) & (confidence <= right)
+            else:
+                mask = (confidence >= left) & (confidence < right)
+
+            if not mask.any():
+                continue
+
+            bucket_conf = float(np.mean(confidence[mask]))
+            bucket_acc = float(
+                np.mean(predicted[mask] == actual[mask])
+            )
+            ece += (
+                float(mask.sum()) / len(actual)
+            ) * abs(bucket_acc - bucket_conf)
+
+        summary["ece"] = float(ece)
+
+    except Exception:
+        pass
+
+    return summary
+
+
+def _build_adaptive_confidence(
+    probability_up,
+    agreement,
+    weekly_trend,
+    monthly_trend,
+    three_timeframe_alignment,
+    market_context,
+    sector_context,
+    relative_strength,
+    sentiment_score,
+    reliability,
+):
+    """
+    Convert multiple independent evidence sources into an evidence score.
+
+    This does NOT force probability to 90%. It produces a separate
+    confidence/evidence assessment and identifies contradictions.
+    """
+    p_up = _bounded(probability_up)
+    agreement = _bounded(agreement)
+
+    direction = 1.0 if p_up >= 0.5 else -1.0
+
+    trend_values = [
+        _trend_polarity(weekly_trend),
+        _trend_polarity(monthly_trend),
+        _trend_polarity(three_timeframe_alignment),
+    ]
+
+    market = _context_score(market_context)
+    sector = _context_score(sector_context)
+
+    relative = _context_score(relative_strength)
+
+    sentiment = float(
+        np.clip(
+            _safe_float(sentiment_score, 0.0),
+            -1.0,
+            1.0,
+        )
+    )
+
+    # Evidence direction relative to the model's prediction.
+    aligned_trends = np.mean(
+        [x * direction for x in trend_values]
+    )
+
+    context_alignment = np.mean(
+        [
+            market * direction,
+            sector * direction,
+            relative * direction,
+            sentiment * direction,
+        ]
+    )
+
+    probability_strength = abs(p_up - 0.5) * 2.0
+
+    # Independent evidence score. Model probability is important,
+    # but agreement and external/contextual confirmation matter too.
+    evidence_score = (
+        0.35 * probability_strength
+        + 0.25 * agreement
+        + 0.20 * max(0.0, aligned_trends)
+        + 0.20 * max(0.0, context_alignment)
+    )
+
+    evidence_score = float(np.clip(evidence_score, 0.0, 1.0))
+
+    contradictions = []
+
+    if agreement < 0.60:
+        contradictions.append("models disagree")
+
+    if aligned_trends < -0.20:
+        contradictions.append("higher timeframes disagree")
+
+    if context_alignment < -0.20:
+        contradictions.append("market/sector/news context conflicts")
+
+    reliability_ready = bool(
+        reliability.get("available")
+        and reliability.get("high_confidence_samples", 0) >= 10
+        and np.isfinite(
+            reliability.get("high_confidence_accuracy", np.nan)
+        )
+    )
+
+    high_confidence_supported = False
+
+    if reliability_ready:
+        observed_high_accuracy = float(
+            reliability["high_confidence_accuracy"]
+        )
+        high_confidence_supported = bool(
+            p_up >= 0.90
+            and observed_high_accuracy >= 0.80
+            and agreement >= 0.80
+            and evidence_score >= 0.80
+        )
+    else:
+        # No historical support means the engine must not claim
+        # that a >=90% confidence level is validated.
+        high_confidence_supported = False
+
+    if p_up >= 0.90 and not high_confidence_supported:
+        contradictions.append(
+            "90% confidence is not historically supported by the "
+            "available validation evidence"
+        )
+
+    if contradictions:
+        evidence_status = "CONFLICTED"
+    elif high_confidence_supported:
+        evidence_status = "HIGH-CONFIDENCE SUPPORTED"
+    elif evidence_score >= 0.75:
+        evidence_status = "STRONG EVIDENCE"
+    elif evidence_score >= 0.55:
+        evidence_status = "MODERATE EVIDENCE"
+    else:
+        evidence_status = "LIMITED EVIDENCE"
+
+    # A conservative confidence estimate: never manufacture a value
+    # above the underlying model probability.
+    evidence_confidence = float(
+        min(
+            p_up,
+            0.50 + 0.50 * evidence_score,
+        )
+    )
+
+    return {
+        "evidence_score": evidence_score,
+        "evidence_confidence": evidence_confidence,
+        "evidence_status": evidence_status,
+        "contradictions": contradictions,
+        "direction": "UP" if direction > 0 else "DOWN",
+        "high_confidence_supported": high_confidence_supported,
+        "historical_reliability_available": reliability_ready,
+        "high_confidence_validation_samples": int(
+            reliability.get("high_confidence_samples", 0)
+        ),
+        "high_confidence_validation_accuracy": (
+            float(reliability["high_confidence_accuracy"])
+            if np.isfinite(
+                reliability.get("high_confidence_accuracy", np.nan)
+            )
+            else np.nan
+        ),
+        "ece": (
+            float(reliability["ece"])
+            if np.isfinite(reliability.get("ece", np.nan))
+            else np.nan
+        ),
+    }
+
+
+
 def analyze_stock(
     df: pd.DataFrame,
     horizon: int = 5,
@@ -1598,6 +1884,31 @@ def analyze_stock(
     )
 
     # ================================================================
+    # ADAPTIVE CONFIDENCE & EVIDENCE ENGINE
+    # ================================================================
+
+    adaptive_reliability = _extract_reliability_summary(model)
+
+    adaptive_confidence = _build_adaptive_confidence(
+        probability_up=final_probability,
+        agreement=_safe_float(
+            model_agreement.get("agreement", 0.0),
+            0.0,
+        ),
+        weekly_trend=weekly_trend,
+        monthly_trend=monthly_trend,
+        three_timeframe_alignment=three_timeframe_alignment,
+        market_context=market_context,
+        sector_context=sector_context,
+        relative_strength=relative_strength,
+        sentiment_score=sentiment_score,
+        reliability=adaptive_reliability,
+    )
+
+    # The adaptive engine is deliberately a confidence/evidence layer.
+    # It does not rewrite the underlying calibrated ML probability.
+
+    # ================================================================
     # PRICE / TRADE PLAN
     # ================================================================
 
@@ -1650,6 +1961,26 @@ def analyze_stock(
 
     model_summary = model.summary()
 
+    try:
+        model_summary["adaptive_evidence_score"] = float(
+            adaptive_confidence.get("evidence_score", 0.0)
+        )
+        model_summary["adaptive_evidence_status"] = str(
+            adaptive_confidence.get(
+                "evidence_status",
+                "LIMITED EVIDENCE",
+            )
+        )
+        model_summary["high_confidence_supported"] = bool(
+            adaptive_confidence.get(
+                "high_confidence_supported",
+                False,
+            )
+        )
+    except Exception:
+        pass
+
+
     # ================================================================
     # NEWS
     # ================================================================
@@ -1699,6 +2030,54 @@ def analyze_stock(
 
             "uncertainty": float(
                 uncertainty
+            ),
+
+            # --------------------------------------------------------
+            # ADAPTIVE CONFIDENCE / EVIDENCE
+            # --------------------------------------------------------
+
+            "adaptive_confidence": adaptive_confidence,
+
+            "evidence_score": float(
+                adaptive_confidence.get(
+                    "evidence_score",
+                    0.0,
+                )
+            ),
+
+            "evidence_confidence": float(
+                adaptive_confidence.get(
+                    "evidence_confidence",
+                    0.0,
+                )
+            ),
+
+            "evidence_status": str(
+                adaptive_confidence.get(
+                    "evidence_status",
+                    "LIMITED EVIDENCE",
+                )
+            ),
+
+            "evidence_contradictions": list(
+                adaptive_confidence.get(
+                    "contradictions",
+                    [],
+                )
+            ),
+
+            "high_confidence_supported": bool(
+                adaptive_confidence.get(
+                    "high_confidence_supported",
+                    False,
+                )
+            ),
+
+            "historical_reliability_available": bool(
+                adaptive_confidence.get(
+                    "historical_reliability_available",
+                    False,
+                )
             ),
 
             "horizon": int(
