@@ -1,23 +1,25 @@
 """
 Walk-Forward Swing Trading Backtester
 
-Designed for realistic chronological evaluation.
+Features:
+- Chronological walk-forward training
+- Ensemble ML model
+- Model agreement filter
+- Next-day-open entry
+- Stop-loss / target / horizon exits
+- Transaction costs
+- Slippage
+- Risk-based position sizing
+- Equity curve
+- Drawdown
+- Sharpe
+- CAGR
+- Win rate
+- Profit factor
 
-Key principles:
-- No random train/test split
-- No future information in model training
-- Signal generated at the decision close
-- Entry occurs at the following trading day's open
-- Stop-loss / target / time-based exits
-- Transaction costs and slippage
-- Walk-forward model retraining
-- Ensemble probability
-- Model agreement
-- Performance diagnostics
-
-Historical news sentiment is intentionally NOT fetched here.
-Using today's news for historical trades would create look-ahead bias.
-Time-aligned historical sentiment can be added later.
+Historical sentiment is intentionally not used here yet because
+using today's news against historical trades would create
+look-ahead bias.
 """
 
 from __future__ import annotations
@@ -28,8 +30,13 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 
-from src.features.engine import build_features
-from src.models.classifier import SwingClassifier
+from src.features.engine import (
+    build_features as engine_build_features
+)
+
+from src.models.classifier import (
+    SwingClassifier
+)
 
 
 # =====================================================================
@@ -39,6 +46,7 @@ from src.models.classifier import SwingClassifier
 
 @dataclass
 class BacktestConfig:
+
     initial_capital: float = 100000.0
 
     horizon: int = 5
@@ -59,10 +67,8 @@ class BacktestConfig:
 
     min_train_rows: int = 180
 
-    # Require minimum model agreement before entering.
     min_model_agreement: float = 0.60
 
-    # Maximum number of simultaneous positions.
     max_positions: int = 1
 
 
@@ -89,10 +95,14 @@ def _safe_float(
     return float(default)
 
 
+# =====================================================================
+# OHLCV NORMALIZATION
+# =====================================================================
+
+
 def _normalize_ohlcv(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Normalize OHLCV columns."""
 
     data = df.copy()
 
@@ -104,28 +114,24 @@ def _normalize_ohlcv(
         data.columns = [
             "_".join(
                 str(x)
-                for x in col
+                for x in column
                 if str(x).lower() != "nan"
             ).strip("_")
-            for col in data.columns
+            for column in data.columns
         ]
 
     data.columns = [
-        str(c).strip().lower()
-        for c in data.columns
+        str(column)
+        .strip()
+        .lower()
+        for column in data.columns
     ]
 
-    # Common Yahoo Finance naming variants.
     rename_map = {}
 
     for column in data.columns:
 
-        clean = column.replace(
-            " ",
-            "_",
-        )
-
-        if clean in {
+        if column in {
             "adj_close",
             "adjusted_close",
         }:
@@ -145,12 +151,13 @@ def _normalize_ohlcv(
     ]
 
     missing = [
-        c
-        for c in required
-        if c not in data.columns
+        column
+        for column in required
+        if column not in data.columns
     ]
 
     if missing:
+
         raise ValueError(
             "Missing OHLCV columns: "
             + ", ".join(missing)
@@ -174,7 +181,6 @@ def _normalize_ohlcv(
 
     data = data.sort_index()
 
-    # Remove duplicate timestamps.
     data = data[
         ~data.index.duplicated(
             keep="last"
@@ -182,11 +188,17 @@ def _normalize_ohlcv(
     ]
 
     if data.empty:
+
         raise ValueError(
             "No valid OHLCV data remains."
         )
 
     return data
+
+
+# =====================================================================
+# EQUITY METRICS
+# =====================================================================
 
 
 def _calculate_equity_metrics(
@@ -214,6 +226,7 @@ def _calculate_equity_metrics(
     ).dropna()
 
     if equity.empty:
+
         return {
             "total_return": 0.0,
             "cagr": 0.0,
@@ -250,17 +263,17 @@ def _calculate_equity_metrics(
         * abs(max_drawdown_pct)
     )
 
-    returns = equity.pct_change().dropna()
+    returns = (
+        equity
+        .pct_change()
+        .dropna()
+    )
 
     if len(returns) >= 2:
 
         volatility = float(
             returns.std()
             * np.sqrt(252)
-        )
-
-        mean_return = float(
-            returns.mean()
         )
 
         std_return = float(
@@ -270,22 +283,19 @@ def _calculate_equity_metrics(
         if std_return > 0:
 
             sharpe = float(
-                mean_return
+                returns.mean()
                 / std_return
                 * np.sqrt(252)
             )
 
         else:
+
             sharpe = 0.0
 
     else:
 
         volatility = 0.0
         sharpe = 0.0
-
-    # ---------------------------------------------------------------
-    # CAGR
-    # ---------------------------------------------------------------
 
     try:
 
@@ -313,6 +323,7 @@ def _calculate_equity_metrics(
             )
 
         else:
+
             cagr = 0.0
 
     except Exception:
@@ -323,7 +334,9 @@ def _calculate_equity_metrics(
         "total_return": float(
             total_return
         ),
-        "cagr": float(cagr),
+        "cagr": float(
+            cagr
+        ),
         "max_drawdown": float(
             max_drawdown
         ),
@@ -340,7 +353,7 @@ def _calculate_equity_metrics(
 
 
 # =====================================================================
-# EXIT LOGIC
+# EXIT SIMULATION
 # =====================================================================
 
 
@@ -354,11 +367,11 @@ def _simulate_exit(
     horizon: int,
 ) -> Dict[str, Any]:
 
-    last_index = len(data) - 1
+    last_position = len(data) - 1
 
     max_exit_position = min(
         entry_position + horizon,
-        last_index,
+        last_position,
     )
 
     for position in range(
@@ -376,13 +389,9 @@ def _simulate_exit(
             row["low"]
         )
 
-        close = float(
-            row["close"]
-        )
-
-        # -----------------------------------------------------------
+        # ------------------------------------------------------------
         # LONG
-        # -----------------------------------------------------------
+        # ------------------------------------------------------------
 
         if signal == "BUY":
 
@@ -397,7 +406,7 @@ def _simulate_exit(
             )
 
             # Conservative assumption:
-            # if both levels are hit on the same candle,
+            # if both stop and target are hit in the same candle,
             # assume the stop was hit first.
             if low <= stop_price:
 
@@ -415,9 +424,9 @@ def _simulate_exit(
                     "exit_reason": "TARGET",
                 }
 
-        # -----------------------------------------------------------
+        # ------------------------------------------------------------
         # SHORT
-        # -----------------------------------------------------------
+        # ------------------------------------------------------------
 
         elif signal == "SELL":
 
@@ -447,10 +456,6 @@ def _simulate_exit(
                     "exit_reason": "TARGET",
                 }
 
-    # ---------------------------------------------------------------
-    # HORIZON / LAST AVAILABLE CLOSE
-    # ---------------------------------------------------------------
-
     exit_position = max_exit_position
 
     exit_price = float(
@@ -459,24 +464,27 @@ def _simulate_exit(
         ]["close"]
     )
 
-    if exit_position >= last_index:
-        reason = "END OF DATA"
+    if exit_position >= last_position:
+
+        exit_reason = "END OF DATA"
+
     else:
-        reason = "HORIZON"
+
+        exit_reason = "HORIZON"
 
     return {
         "exit_position": exit_position,
         "exit_price": exit_price,
-        "exit_reason": reason,
+        "exit_reason": exit_reason,
     }
 
 
 # =====================================================================
-# TRADE PNL
+# TRADE RETURN
 # =====================================================================
 
 
-def _calculate_trade_pnl(
+def _calculate_trade_return(
     signal: str,
     entry_price: float,
     exit_price: float,
@@ -492,7 +500,6 @@ def _calculate_trade_pnl(
         exit_price
     )
 
-    # Slippage works against the position.
     if signal == "BUY":
 
         effective_entry = (
@@ -529,7 +536,6 @@ def _calculate_trade_pnl(
             - 1.0
         )
 
-    # Approximate round-trip transaction cost.
     net_return = (
         gross_return
         - 2.0 * transaction_cost
@@ -556,54 +562,78 @@ def run_backtest(
         BacktestConfig
     ] = None,
 ) -> Dict[str, Any]:
-    """
-    Execute a walk-forward backtest.
-
-    Signal date:
-        close of day t
-
-    Entry:
-        open of day t+1
-
-    Training:
-        only information available before the signal.
-
-    This is deliberately conservative.
-    """
 
     if config is None:
+
         config = BacktestConfig()
+
+    # ---------------------------------------------------------------
+    # VALIDATION
+    # ---------------------------------------------------------------
+
+    if config.horizon < 1:
+
+        raise ValueError(
+            "Horizon must be at least 1."
+        )
+
+    if config.retrain_every < 1:
+
+        raise ValueError(
+            "Retrain interval must be at least 1."
+        )
+
+    if not (
+        0.50
+        <= config.probability_threshold
+        < 1.0
+    ):
+
+        raise ValueError(
+            "Probability threshold must be "
+            "between 0.50 and 0.99."
+        )
+
+    # ---------------------------------------------------------------
+    # DATA
+    # ---------------------------------------------------------------
 
     data = _normalize_ohlcv(
         df
     )
 
-    if len(data) < (
+    minimum_required = (
         config.min_train_rows
         + config.horizon
         + 10
-    ):
+    )
+
+    if len(data) < minimum_required:
 
         raise ValueError(
             "Not enough historical data for "
-            "walk-forward backtesting."
+            "walk-forward backtesting. "
+            f"Need at least {minimum_required} "
+            f"rows, got {len(data)}."
         )
 
-    # ================================================================
-    # FEATURE ENGINEERING
-    # ================================================================
+    # ---------------------------------------------------------------
+    # FEATURES
+    # ---------------------------------------------------------------
 
-    features = build_features(
+    features = engine_build_features(
         data
     )
 
-    if features is None or features.empty:
+    if (
+        features is None
+        or features.empty
+    ):
 
         raise ValueError(
             "Feature engineering returned no data."
         )
 
-    # Align data/features.
     common_index = (
         data.index.intersection(
             features.index
@@ -619,32 +649,34 @@ def run_backtest(
     ].copy()
 
     data = data.sort_index()
+
     features = features.sort_index()
 
-    # ================================================================
-    # PORTFOLIO STATE
-    # ================================================================
+    # ---------------------------------------------------------------
+    # PORTFOLIO
+    # ---------------------------------------------------------------
 
     capital = float(
         config.initial_capital
     )
 
-    equity_values = []
-    equity_dates = []
-
     trades = []
 
-    last_retrain_position = -10**9
+    equity_dates = []
+
+    equity_values = []
 
     cached_model = None
 
-    cached_model_position = -1
+    last_retrain_position = -10**9
+
+    last_model_position = -1
 
     position_open_until = -1
 
-    # ================================================================
+    # ---------------------------------------------------------------
     # WALK FORWARD
-    # ================================================================
+    # ---------------------------------------------------------------
 
     start_position = (
         config.min_train_rows
@@ -655,49 +687,52 @@ def run_backtest(
         len(data) - 1,
     ):
 
-        # ------------------------------------------------------------
-        # Mark current equity.
-        # ------------------------------------------------------------
+        current_date = data.index[
+            signal_position
+        ]
+
+        # -----------------------------------------------------------
+        # Record equity at current decision date.
+        # -----------------------------------------------------------
+
+        equity_dates.append(
+            current_date
+        )
 
         equity_values.append(
             capital
         )
 
-        equity_dates.append(
-            data.index[
-                signal_position
-            ]
-        )
-
-        # ------------------------------------------------------------
-        # Skip if another trade is still active.
-        # ------------------------------------------------------------
+        # -----------------------------------------------------------
+        # Existing position.
+        # -----------------------------------------------------------
 
         if (
             signal_position
             <= position_open_until
         ):
+
             continue
 
-        # ------------------------------------------------------------
-        # Retrain periodically.
-        # ------------------------------------------------------------
+        # -----------------------------------------------------------
+        # Retraining.
+        # -----------------------------------------------------------
 
-        if (
+        should_retrain = (
             cached_model is None
             or (
                 signal_position
                 - last_retrain_position
                 >= config.retrain_every
             )
-        ):
+        )
 
-            # IMPORTANT:
-            # Training data ends at the signal date.
+        if should_retrain:
+
+            # Training data ends at current decision date.
             #
-            # The classifier's future target automatically removes
-            # the last `horizon` observations because their future
-            # outcome is not yet known.
+            # SwingClassifier removes the final `horizon` rows
+            # because their future outcome is not yet known.
             train_features = features.iloc[
                 : signal_position + 1
             ].copy()
@@ -709,12 +744,7 @@ def run_backtest(
                     probability_threshold=(
                         config.probability_threshold
                     ),
-                    min_samples=(
-                        min(
-                            config.min_train_rows,
-                            80,
-                        )
-                    ),
+                    min_samples=80,
                 )
 
                 model.fit(
@@ -727,19 +757,21 @@ def run_backtest(
                     signal_position
                 )
 
-                cached_model_position = (
+                last_model_position = (
                     signal_position
                 )
 
             except Exception:
+
                 continue
 
-        # ------------------------------------------------------------
-        # Generate signal using information available at t.
-        # ------------------------------------------------------------
-
         if cached_model is None:
+
             continue
+
+        # -----------------------------------------------------------
+        # Current prediction.
+        # -----------------------------------------------------------
 
         current_features = features.iloc[
             [signal_position]
@@ -748,12 +780,14 @@ def run_backtest(
         try:
 
             probability = float(
-                cached_model.predict_proba(
+                cached_model
+                .predict_proba(
                     current_features
                 )[0, 1]
             )
 
         except Exception:
+
             continue
 
         probability = float(
@@ -764,14 +798,15 @@ def run_backtest(
             )
         )
 
-        # ------------------------------------------------------------
-        # Model agreement.
-        # ------------------------------------------------------------
+        # -----------------------------------------------------------
+        # Agreement.
+        # -----------------------------------------------------------
 
         try:
 
             agreement_info = (
-                cached_model.model_agreement(
+                cached_model
+                .model_agreement(
                     current_features
                 )
             )
@@ -788,9 +823,9 @@ def run_backtest(
 
             agreement = 0.0
 
-        # ------------------------------------------------------------
-        # Signal.
-        # ------------------------------------------------------------
+        # -----------------------------------------------------------
+        # Direction.
+        # -----------------------------------------------------------
 
         if probability >= (
             config.probability_threshold
@@ -809,9 +844,9 @@ def run_backtest(
 
             signal = "WAIT"
 
-        # ------------------------------------------------------------
+        # -----------------------------------------------------------
         # Agreement filter.
-        # ------------------------------------------------------------
+        # -----------------------------------------------------------
 
         if (
             signal != "WAIT"
@@ -822,17 +857,19 @@ def run_backtest(
             signal = "WAIT"
 
         if signal == "WAIT":
+
             continue
 
-        # ------------------------------------------------------------
-        # Entry next day.
-        # ------------------------------------------------------------
+        # -----------------------------------------------------------
+        # NEXT DAY ENTRY
+        # -----------------------------------------------------------
 
         entry_position = (
             signal_position + 1
         )
 
         if entry_position >= len(data):
+
             break
 
         entry_date = data.index[
@@ -845,15 +882,18 @@ def run_backtest(
             ]["open"]
         )
 
-        if not np.isfinite(
-            entry_price
-        ) or entry_price <= 0:
+        if (
+            not np.isfinite(
+                entry_price
+            )
+            or entry_price <= 0
+        ):
 
             continue
 
-        # ------------------------------------------------------------
-        # Position sizing.
-        # ------------------------------------------------------------
+        # -----------------------------------------------------------
+        # RISK-BASED POSITION SIZE
+        # -----------------------------------------------------------
 
         risk_amount = (
             capital
@@ -888,9 +928,9 @@ def run_backtest(
 
             continue
 
-        # ------------------------------------------------------------
-        # Exit simulation.
-        # ------------------------------------------------------------
+        # -----------------------------------------------------------
+        # EXIT
+        # -----------------------------------------------------------
 
         exit_info = _simulate_exit(
             data=data,
@@ -928,26 +968,24 @@ def run_backtest(
             ]
         )
 
-        # ------------------------------------------------------------
-        # PNL.
-        # ------------------------------------------------------------
+        # -----------------------------------------------------------
+        # PNL
+        # -----------------------------------------------------------
 
-        pnl_info = (
-            _calculate_trade_pnl(
+        return_info = (
+            _calculate_trade_return(
                 signal=signal,
                 entry_price=entry_price,
                 exit_price=exit_price,
                 transaction_cost=(
                     config.transaction_cost
                 ),
-                slippage=(
-                    config.slippage
-                ),
+                slippage=config.slippage,
             )
         )
 
         net_return = float(
-            pnl_info[
+            return_info[
                 "net_return"
             ]
         )
@@ -964,49 +1002,64 @@ def run_backtest(
             capital + pnl,
         )
 
-        # ------------------------------------------------------------
-        # Record trade.
-        # ------------------------------------------------------------
+        # -----------------------------------------------------------
+        # RECORD
+        # -----------------------------------------------------------
 
         trades.append(
             {
-                "signal_date": data.index[
-                    signal_position
-                ],
+                "signal_date": current_date,
+
                 "entry_date": entry_date,
+
                 "exit_date": exit_date,
+
                 "signal": signal,
+
                 "probability_up": probability,
+
                 "model_agreement": agreement,
+
                 "entry_price": entry_price,
+
                 "exit_price": exit_price,
+
                 "quantity": quantity,
-                "gross_return": pnl_info[
+
+                "gross_return": return_info[
                     "gross_return"
                 ],
+
                 "net_return": net_return,
+
                 "pnl": pnl,
-                "capital_before": capital_before,
+
+                "capital_before": (
+                    capital_before
+                ),
+
                 "capital_after": capital,
+
                 "exit_reason": exit_reason,
+
                 "model_retrained": (
-                    cached_model_position
+                    last_model_position
                     == signal_position
                 ),
             }
         )
 
-        # ------------------------------------------------------------
-        # Prevent overlapping trades.
-        # ------------------------------------------------------------
+        # -----------------------------------------------------------
+        # Block overlapping positions.
+        # -----------------------------------------------------------
 
         position_open_until = (
             exit_position
         )
 
-    # ================================================================
+    # =================================================================
     # FINAL EQUITY
-    # ================================================================
+    # =================================================================
 
     if not equity_dates:
 
@@ -1028,7 +1081,6 @@ def run_backtest(
             equity_values
         )
 
-        # Add final capital.
         equity_dates.append(
             data.index[-1]
         )
@@ -1052,17 +1104,17 @@ def run_backtest(
             .sort_index()
         )
 
-    # ================================================================
-    # TRADE DATAFRAME
-    # ================================================================
+    # =================================================================
+    # TRADES
+    # =================================================================
 
     trades_df = pd.DataFrame(
         trades
     )
 
-    # ================================================================
-    # METRICS
-    # ================================================================
+    # =================================================================
+    # EQUITY METRICS
+    # =================================================================
 
     equity_metrics = (
         _calculate_equity_metrics(
@@ -1071,15 +1123,21 @@ def run_backtest(
         )
     )
 
+    # =================================================================
+    # TRADE METRICS
+    # =================================================================
+
     if trades_df.empty:
 
+        winning_trades = 0
+        losing_trades = 0
         win_rate = 0.0
         profit_factor = 0.0
         average_trade = 0.0
         best_trade = 0.0
         worst_trade = 0.0
-        winning_trades = 0
-        losing_trades = 0
+        average_probability = 0.0
+        average_agreement = 0.0
 
     else:
 
@@ -1153,17 +1211,6 @@ def run_backtest(
             trade_returns.min()
         )
 
-    # ================================================================
-    # MODEL DIAGNOSTICS
-    # ================================================================
-
-    if trades_df.empty:
-
-        average_probability = 0.0
-        average_agreement = 0.0
-
-    else:
-
         average_probability = float(
             trades_df[
                 "probability_up"
@@ -1175,6 +1222,10 @@ def run_backtest(
                 "model_agreement"
             ].mean()
         )
+
+    # =================================================================
+    # METRICS
+    # =================================================================
 
     metrics = {
         **equity_metrics,
@@ -1228,9 +1279,9 @@ def run_backtest(
         ),
     }
 
-    # ================================================================
+    # =================================================================
     # RESULT
-    # ================================================================
+    # =================================================================
 
     return {
         "metrics": metrics,
@@ -1262,7 +1313,7 @@ def run_backtest(
 
 
 # =====================================================================
-# COMPATIBILITY WRAPPER
+# BACKWARD-COMPATIBLE FUNCTION
 # =====================================================================
 
 
@@ -1279,9 +1330,6 @@ def backtest(
     min_train_rows: int = 180,
     **kwargs: Any,
 ) -> Dict[str, Any]:
-    """
-    Backward-compatible backtest() function.
-    """
 
     config = BacktestConfig(
         horizon=int(
@@ -1320,7 +1368,7 @@ def backtest(
 
 
 # =====================================================================
-# FEATURE COMPATIBILITY
+# SAFE FEATURE FUNCTION
 # =====================================================================
 
 
@@ -1328,24 +1376,20 @@ def build_features(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Compatibility wrapper.
+    Compatibility function.
 
-    Uses the project's central feature engine.
+    This directly calls the central feature engine.
+    No recursive reference.
     """
 
-    return globals()[
-        "_build_features"
-    ](df)
-
-
-# Keep original engine reference.
-_build_features = globals()[
-    "build_features"
-]
+    return engine_build_features(
+        df
+    )
 
 
 __all__ = [
     "BacktestConfig",
     "run_backtest",
     "backtest",
+    "build_features",
 ]
