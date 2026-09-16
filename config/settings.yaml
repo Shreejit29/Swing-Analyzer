@@ -1,26 +1,201 @@
-app:
-  name: "AI Swing Stock Analyzer"
-  default_symbol: "RELIANCE.NS"
-  default_period: "2y"
+# ============================================================
+# AI Swing Stock Analyzer
+# Central Application Configuration
+# ============================================================
+
+# ------------------------------------------------------------
+# Data
+# ------------------------------------------------------------
+
+data:
+  default_period: "1y"
   default_interval: "1d"
 
-strategy:
-  horizon_days: 5
+  supported_periods:
+    - "6mo"
+    - "1y"
+    - "2y"
+    - "5y"
+
+  supported_intervals:
+    - "1d"
+
+
+# ------------------------------------------------------------
+# Machine Learning
+# ------------------------------------------------------------
+
+model:
+  name: "GradientBoostingClassifier"
+
+  n_estimators: 150
+  learning_rate: 0.05
+  max_depth: 3
+
+  min_samples_split: 10
+  min_samples_leaf: 5
+
+  subsample: 0.85
+
+  random_state: 42
+
+  # Internal probability threshold.
+  # Not exposed to the user.
   probability_threshold: 0.60
-  high_confidence_threshold: 0.70
-  stop_loss_pct: 0.03
-  target_pct: 0.06
+
+  # Minimum amount of historical data required
+  # before model training.
+  min_training_rows: 100
+
+
+# ------------------------------------------------------------
+# Prediction
+# ------------------------------------------------------------
+
+prediction:
+  default_horizon: 5
+
+  supported_horizons:
+    - 1
+    - 3
+    - 5
+    - 10
+    - 20
+
+
+# ------------------------------------------------------------
+# Risk Management
+# ------------------------------------------------------------
+
+risk:
+  # Maximum capital risked on one trade.
   risk_per_trade: 0.01
+
+  # Default stop loss.
+  stop_loss_pct: 0.03
+
+  # Default target.
+  target_pct: 0.06
+
+  # Transaction cost assumption.
   transaction_cost: 0.001
+
+  # Slippage assumption.
   slippage: 0.0005
+
+
+# ------------------------------------------------------------
+# Backtesting
+# ------------------------------------------------------------
+
+backtest:
   initial_capital: 100000
 
-features:
-  ema_fast: 20
-  ema_slow: 50
-  ema_long: 200
+  retrain_every: 20
+
+  min_train_rows: 180
+
+  probability_threshold: 0.60
+
+  stop_loss_pct: 0.03
+
+  target_pct: 0.06
+
+  risk_per_trade: 0.01
+
+  transaction_cost: 0.001
+
+  slippage: 0.0005
+
+
+# ------------------------------------------------------------
+# Technical Analysis
+# ------------------------------------------------------------
+
+technical:
+  ema_periods:
+    - 20
+    - 50
+    - 200
+
+  sma_periods:
+    - 20
+    - 50
+
   rsi_period: 14
+
+  macd:
+    fast: 12
+    slow: 26
+    signal: 9
+
   atr_period: 14
-  adx_period: 14
-  bb_period: 20
-  volume_period: 20
+
+  bollinger:
+    period: 20
+    standard_deviation: 2
+
+  roc_periods:
+    - 10
+    - 20
+
+
+# ------------------------------------------------------------
+# Volume Analysis
+# ------------------------------------------------------------
+
+volume:
+  sma_periods:
+    - 5
+    - 10
+    - 20
+    - 50
+
+  relative_volume_period: 20
+
+  obv_slope_period: 10
+
+
+# ------------------------------------------------------------
+# Market Regime
+# ------------------------------------------------------------
+
+regime:
+  bullish_threshold: 3.0
+  bearish_threshold: -3.0
+
+  strong_bullish_threshold: 5.0
+  strong_bearish_threshold: -5.0
+
+
+# ------------------------------------------------------------
+# Multi-Timeframe Analysis
+# ------------------------------------------------------------
+
+multi_timeframe:
+  enabled: true
+
+  weekly: true
+  monthly: true
+
+  avoid_lookahead: true
+
+
+# ------------------------------------------------------------
+# Application
+# ------------------------------------------------------------
+
+app:
+  title: "AI Swing Stock Analyzer"
+
+  page_icon: "📈"
+
+  layout: "wide"
+
+  default_stock: "RELIANCE.NS"
+
+  show_diagnostics: true
+
+  show_feature_importance: true
+
+  show_latest_data: true
