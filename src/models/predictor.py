@@ -20,62 +20,17 @@ OHLCV
 from __future__ import annotations
 
 from typing import Any, Dict
-from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
+import streamlit as st
 
 from src.features.engine import build_features
 from src.features.regime import market_regime
 from src.models.classifier import SwingClassifier
-from src.models.signal_engine import SignalStabilityEngine
 from src.data.sentiment import get_stock_sentiment
 from src.data.market import market_summary
 from src.data.sector import get_sector, sector_summary
-
-
-# Live signal state. The analyzer can refresh frequently, so we preserve the
-# confirmed swing signal between reruns instead of allowing every refresh to
-# create a brand-new decision. Backtesting does not use this state.
-_SIGNAL_ENGINES: Dict[str, SignalStabilityEngine] = {}
-_SIGNAL_LAST_OBSERVATION: Dict[str, str] = {}
-_SIGNAL_LAST_PROBABILITY: Dict[str, float] = {}
-_SIGNAL_LAST_TIMESTAMP: Dict[str, str] = {}
-
-
-def _get_signal_engine(ticker: str, horizon: int) -> SignalStabilityEngine:
-    key = f"{str(ticker).upper().strip()}::{int(horizon)}"
-    if key not in _SIGNAL_ENGINES:
-        _SIGNAL_ENGINES[key] = SignalStabilityEngine(
-            buy_entry=0.65,
-            buy_exit=0.55,
-            sell_entry=0.35,
-            sell_exit=0.45,
-            persistence=2,
-        )
-    return _SIGNAL_ENGINES[key]
-
-
-def _latest_observation_id(df: pd.DataFrame) -> str:
-    if df is None or df.empty:
-        return ""
-    try:
-        return str(df.index[-1])
-    except Exception:
-        return ""
-
-
-def _directional_score(value: Any) -> float:
-    try:
-        number = float(value)
-    except Exception:
-        return 0.0
-    if not np.isfinite(number):
-        return 0.0
-    if 1.0 < number <= 100.0:
-        number = (number - 50.0) / 50.0
-    return float(np.clip(number, -1.0, 1.0))
-
 
 
 # =====================================================================
@@ -1516,6 +1471,18 @@ def _build_adaptive_confidence(
 
 
 
+@st.cache_data(ttl=300, max_entries=64, show_spinner=False)
+def _cached_build_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Cache deterministic feature engineering for repeated live reruns."""
+    return build_features(df)
+
+
+@st.cache_data(ttl=300, max_entries=128, show_spinner=False)
+def _cached_sentiment(ticker: str, max_items: int = 20) -> dict:
+    """Cache news sentiment briefly so every Streamlit rerun does not refetch news."""
+    return get_stock_sentiment(ticker=ticker, max_items=max_items)
+
+
 def analyze_stock(
     df: pd.DataFrame,
     horizon: int = 5,
@@ -1551,9 +1518,7 @@ def analyze_stock(
     # FEATURE ENGINEERING
     # ================================================================
 
-    features = build_features(
-        df
-    )
+    features = _cached_build_features(df)
 
     if (
         features is None
@@ -1719,12 +1684,7 @@ def analyze_stock(
 
         try:
 
-            sentiment_data = (
-                get_stock_sentiment(
-                    ticker=ticker,
-                    max_items=20,
-                )
-            )
+            sentiment_data = _cached_sentiment(ticker, 20)
 
         except Exception:
             pass
@@ -1791,7 +1751,7 @@ def analyze_stock(
         probability_threshold,
     )
 
-    filtered_signal = (
+    final_signal = (
         _apply_agreement_filter(
             signal=base_signal,
             probability_up=(
@@ -1806,11 +1766,6 @@ def analyze_stock(
             ),
         )
     )
-
-    # Keep the legacy raw/filtered decision available for diagnostics.
-    # final_signal is replaced below by the stateful stability engine after
-    # all higher-timeframe/context inputs have been calculated.
-    final_signal = filtered_signal
 
     # ================================================================
     # CONFIDENCE
@@ -1910,94 +1865,6 @@ def analyze_stock(
             features
         )
     )
-
-    # ================================================================
-    # SIGNAL STABILITY ENGINE
-    # ================================================================
-    # A new intraday bar may legitimately change the ML probability. We do
-    # not, however, want a Streamlit refresh of the same bar to count as a
-    # second confirmation. Persistence therefore advances only when the
-    # latest market observation changes.
-
-    signal_engine = _get_signal_engine(ticker, horizon)
-    observation_id = _latest_observation_id(features)
-    engine_key = f"{str(ticker).upper().strip()}::{int(horizon)}"
-    previous_observation = _SIGNAL_LAST_OBSERVATION.get(engine_key)
-    previous_probability = _SIGNAL_LAST_PROBABILITY.get(engine_key)
-    prediction_timestamp = datetime.now(timezone.utc).isoformat()
-    probability_change = (
-        float(final_probability - previous_probability)
-        if previous_probability is not None
-        else None
-    )
-
-    if previous_observation is None:
-        prediction_status = "FRESH"
-    elif observation_id == previous_observation:
-        prediction_status = "STABLE OBSERVATION"
-    elif probability_change is not None and abs(probability_change) < 0.015:
-        prediction_status = "STABLE"
-    else:
-        prediction_status = "CHANGED"
-
-    regime_score = 0.0
-    regime_upper = str(regime).upper()
-    if regime_upper in {"STRONG BULL", "BULL"}:
-        regime_score = 1.0
-    elif regime_upper in {"STRONG BEAR", "BEAR"}:
-        regime_score = -1.0
-
-    if observation_id != previous_observation:
-        stable_decision = signal_engine.update(
-            probability=final_probability,
-            agreement=_safe_float(
-                model_agreement.get("agreement", 0.0),
-                0.0,
-            ),
-            trend_score=_directional_score(
-                structure.get("trend_score", 0.0)
-            ),
-            regime_score=regime_score,
-            mtf_score=_directional_score(
-                higher_timeframe_score
-            ),
-            sentiment_score=_directional_score(
-                sentiment_score
-            ),
-            volume_score=_directional_score(
-                structure.get("volume_score", 0.0)
-            ),
-            volatility_score=0.0,
-        )
-        _SIGNAL_LAST_OBSERVATION[engine_key] = observation_id
-    else:
-        state = signal_engine.get_state()
-        stable_decision = {
-            "signal": state.get("signal", "WAIT"),
-            "raw_probability": float(final_probability),
-            "evidence_score": float(state.get("last_score", 0.0)),
-            "agreement": _safe_float(
-                model_agreement.get("agreement", 0.0),
-                0.0,
-            ),
-            "stability": state.get("stability", "LOW"),
-            "changed": False,
-            "confirmed": False,
-            "pending_signal": state.get("pending_signal", "WAIT"),
-            "pending_count": int(state.get("pending_count", 0)),
-            "reason": "Same market observation; signal state preserved.",
-            "components": {},
-        }
-
-    final_signal = str(
-        stable_decision.get("signal", filtered_signal)
-    )
-
-    # Persist the latest observation metadata only after the decision has
-    # been computed. This lets repeated Streamlit refreshes distinguish a
-    # genuinely new market observation from a rerun of the same observation.
-    _SIGNAL_LAST_PROBABILITY[engine_key] = float(final_probability)
-    _SIGNAL_LAST_TIMESTAMP[engine_key] = prediction_timestamp
 
     # ================================================================
     # 90% CONFIDENCE EVIDENCE GATE
@@ -2101,18 +1968,6 @@ def analyze_stock(
     model_summary = model.summary()
 
     try:
-        model_summary["prediction_status"] = prediction_status
-        model_summary["prediction_observation_id"] = observation_id
-        model_summary["prediction_timestamp"] = prediction_timestamp
-        model_summary["prediction_probability_change"] = (
-            float(probability_change)
-            if probability_change is not None
-            else None
-        )
-    except Exception:
-        pass
-
-    try:
         model_summary["adaptive_evidence_score"] = float(
             adaptive_confidence.get("evidence_score", 0.0)
         )
@@ -2150,58 +2005,6 @@ def analyze_stock(
             "signal": final_signal,
 
             "base_signal": base_signal,
-
-            "filtered_signal": filtered_signal,
-
-            "stable_signal": final_signal,
-
-            "signal_stability": stable_decision,
-
-            "signal_changed": bool(
-                stable_decision.get("changed", False)
-            ),
-
-            "signal_pending": str(
-                stable_decision.get("pending_signal", "WAIT")
-            ),
-
-            "signal_pending_count": int(
-                stable_decision.get("pending_count", 0)
-            ),
-
-            # --------------------------------------------------------
-            # PREDICTION SNAPSHOT / CONSISTENCY
-            # --------------------------------------------------------
-
-            "prediction_timestamp": prediction_timestamp,
-
-            "prediction_observation_id": observation_id,
-
-            "prediction_previous_observation_id": (
-                previous_observation
-            ),
-
-            "prediction_status": prediction_status,
-
-            "prediction_probability_change": (
-                float(probability_change)
-                if probability_change is not None
-                else None
-            ),
-
-            "prediction_probability_change_abs": (
-                float(abs(probability_change))
-                if probability_change is not None
-                else None
-            ),
-
-            "prediction_previous_probability": (
-                float(previous_probability)
-                if previous_probability is not None
-                else None
-            ),
-
-            "prediction_state_key": engine_key,
 
             "probability_up": float(
                 probability_up
