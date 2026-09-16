@@ -83,6 +83,7 @@ class EnsembleSwingClassifier:
         self.models = {}
         self.model = None
         self.feature_columns: list[str] = []
+        self.feature_names_: list[str] = []
         self.trained_rows = 0
         self.class_balance = {}
 
@@ -424,6 +425,12 @@ class EnsembleSwingClassifier:
             )
 
         self.feature_columns = list(x.columns)
+
+        # Backward-compatible attribute expected by the predictor/UI.
+        # Keep it synchronized with the exact feature order used by the
+        # production ensemble.
+        self.feature_names_ = list(self.feature_columns)
+
         self.trained_rows = len(x)
 
         counts = y.value_counts().to_dict()
