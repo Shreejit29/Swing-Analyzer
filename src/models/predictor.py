@@ -1,25 +1,20 @@
 """
 Swing Stock Predictor
 
-Pipeline:
-    OHLCV
-      ↓
-    Feature Engineering
-      ↓
-    Calibrated ML Ensemble
-      ↓
-    Market Regime / MTF
-      ↓
-    News Sentiment
-      ↓
-    Evidence Fusion
-      ↓
-    BUY / SELL / WAIT
-      ↓
-    Risk Plan
+Complete evidence pipeline:
 
-Sentiment is treated as secondary evidence. It does not blindly
-override the machine-learning ensemble.
+OHLCV
+  -> Technical / Price Action / Volume
+  -> ML Ensemble
+  -> Market Regime
+  -> Multi-Timeframe
+  -> News Sentiment
+  -> Market Context
+  -> Sector Context
+  -> Relative Strength
+  -> Evidence Fusion
+  -> BUY / SELL / WAIT
+  -> Risk Plan
 """
 
 from __future__ import annotations
@@ -33,6 +28,8 @@ from src.features.engine import build_features
 from src.features.regime import market_regime
 from src.models.classifier import SwingClassifier
 from src.data.sentiment import get_stock_sentiment
+from src.data.market import market_summary
+from src.data.sector import get_sector, sector_summary
 
 
 # =====================================================================
@@ -84,10 +81,8 @@ def _latest_value(
     if column not in df.columns:
         return default
 
-    value = df[column].iloc[-1]
-
     return _safe_float(
-        value,
+        df[column].iloc[-1],
         default,
     )
 
@@ -203,8 +198,10 @@ def _calculate_market_structure(
 
     if trend_score >= 2:
         trend = "BULLISH"
+
     elif trend_score <= -2:
         trend = "BEARISH"
+
     else:
         trend = "NEUTRAL"
 
@@ -300,6 +297,345 @@ def _calculate_market_structure(
 
 
 # =====================================================================
+# MARKET CONTEXT
+# =====================================================================
+
+
+def _get_market_context() -> Dict[str, Any]:
+    """
+    Obtain broad-market context.
+
+    The existing market.py module is used as the single source
+    for market-level calculations.
+    """
+
+    try:
+
+        summary = market_summary()
+
+        if isinstance(
+            summary,
+            dict,
+        ):
+            return summary
+
+    except Exception:
+        pass
+
+    return {
+        "trend": "UNKNOWN",
+        "momentum": "UNKNOWN",
+        "volatility": "UNKNOWN",
+        "strength": "UNKNOWN",
+        "volume": "UNKNOWN",
+        "score": 0.0,
+    }
+
+
+# =====================================================================
+# SECTOR CONTEXT
+# =====================================================================
+
+
+def _get_sector_context(
+    ticker: str,
+) -> Dict[str, Any]:
+    """
+    Obtain sector classification and sector context.
+    """
+
+    try:
+
+        sector = get_sector(
+            ticker
+        )
+
+    except Exception:
+
+        sector = "UNKNOWN"
+
+    try:
+
+        summary = sector_summary(
+            sector
+        )
+
+        if not isinstance(
+            summary,
+            dict,
+        ):
+            summary = {}
+
+    except Exception:
+
+        summary = {}
+
+    return {
+        "sector": sector,
+        "summary": summary,
+    }
+
+
+# =====================================================================
+# RELATIVE STRENGTH
+# =====================================================================
+
+
+def _calculate_relative_strength(
+    stock_features: pd.DataFrame,
+    market_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Estimate stock momentum relative to the broad market.
+
+    When a market return feature is unavailable, this falls back
+    to the stock's own multi-period return.
+
+    This is contextual evidence, not a standalone trading signal.
+    """
+
+    stock_return = 0.0
+
+    for column in [
+        "roc20",
+        "return_20",
+        "returns_20",
+        "ret_20",
+    ]:
+
+        if column in stock_features.columns:
+
+            value = _latest_value(
+                stock_features,
+                column,
+                np.nan,
+            )
+
+            if np.isfinite(value):
+
+                stock_return = value
+                break
+
+    market_return = 0.0
+
+    for key in [
+        "return_20",
+        "market_return_20",
+        "roc20",
+        "return",
+        "performance",
+    ]:
+
+        if key in market_context:
+
+            value = _safe_float(
+                market_context.get(key),
+                np.nan,
+            )
+
+            if np.isfinite(value):
+
+                market_return = value
+                break
+
+    relative = (
+        stock_return
+        - market_return
+    )
+
+    if relative > 0.03:
+        classification = "OUTPERFORMING"
+
+    elif relative < -0.03:
+        classification = "UNDERPERFORMING"
+
+    else:
+        classification = "IN LINE"
+
+    return {
+        "stock_return": float(
+            stock_return
+        ),
+        "market_return": float(
+            market_return
+        ),
+        "relative_return": float(
+            relative
+        ),
+        "classification": classification,
+    }
+
+
+# =====================================================================
+# CONTEXT ADJUSTMENT
+# =====================================================================
+
+
+def _context_adjustment(
+    probability_up: float,
+    market_context: Dict[str, Any],
+    sector_context: Dict[str, Any],
+    relative_strength: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Apply a small contextual adjustment.
+
+    The ML ensemble remains the primary quantitative component.
+
+    Context influence is capped so that market/sector data cannot
+    arbitrarily override the ensemble.
+    """
+
+    p = float(
+        np.clip(
+            probability_up,
+            0.0,
+            1.0,
+        )
+    )
+
+    adjustment = 0.0
+    reasons = []
+
+    # ---------------------------------------------------------------
+    # MARKET
+    # ---------------------------------------------------------------
+
+    market_trend = str(
+        market_context.get(
+            "trend",
+            "UNKNOWN",
+        )
+    ).upper()
+
+    market_score = _safe_float(
+        market_context.get(
+            "score",
+            0.0,
+        ),
+        0.0,
+    )
+
+    if "BULL" in market_trend:
+
+        adjustment += 0.025
+        reasons.append(
+            "BROAD MARKET BULLISH"
+        )
+
+    elif "BEAR" in market_trend:
+
+        adjustment -= 0.025
+        reasons.append(
+            "BROAD MARKET BEARISH"
+        )
+
+    elif market_score > 0.50:
+
+        adjustment += 0.015
+        reasons.append(
+            "POSITIVE MARKET SCORE"
+        )
+
+    elif market_score < -0.50:
+
+        adjustment -= 0.015
+        reasons.append(
+            "NEGATIVE MARKET SCORE"
+        )
+
+    # ---------------------------------------------------------------
+    # SECTOR
+    # ---------------------------------------------------------------
+
+    sector_summary_data = (
+        sector_context.get(
+            "summary",
+            {},
+        )
+    )
+
+    if isinstance(
+        sector_summary_data,
+        dict,
+    ):
+
+        sector_score = _safe_float(
+            sector_summary_data.get(
+                "score",
+                0.0,
+            ),
+            0.0,
+        )
+
+        if sector_score > 0.50:
+
+            adjustment += 0.025
+            reasons.append(
+                "SECTOR STRENGTH POSITIVE"
+            )
+
+        elif sector_score < -0.50:
+
+            adjustment -= 0.025
+            reasons.append(
+                "SECTOR STRENGTH NEGATIVE"
+            )
+
+    # ---------------------------------------------------------------
+    # RELATIVE STRENGTH
+    # ---------------------------------------------------------------
+
+    classification = str(
+        relative_strength.get(
+            "classification",
+            "IN LINE",
+        )
+    ).upper()
+
+    if classification == "OUTPERFORMING":
+
+        adjustment += 0.025
+        reasons.append(
+            "STOCK OUTPERFORMING MARKET"
+        )
+
+    elif classification == "UNDERPERFORMING":
+
+        adjustment -= 0.025
+        reasons.append(
+            "STOCK UNDERPERFORMING MARKET"
+        )
+
+    # ---------------------------------------------------------------
+    # CAP
+    # ---------------------------------------------------------------
+
+    adjustment = float(
+        np.clip(
+            adjustment,
+            -0.075,
+            0.075,
+        )
+    )
+
+    adjusted_probability = float(
+        np.clip(
+            p + adjustment,
+            0.0,
+            1.0,
+        )
+    )
+
+    return {
+        "raw_probability": float(p),
+        "adjustment": adjustment,
+        "adjusted_probability": adjusted_probability,
+        "reasons": reasons,
+    }
+
+
+# =====================================================================
 # SENTIMENT FUSION
 # =====================================================================
 
@@ -309,14 +645,6 @@ def _sentiment_adjustment(
     sentiment_score: float,
     sentiment_articles: int,
 ) -> Dict[str, Any]:
-    """
-    Combine ML probability with recent news sentiment.
-
-    ML remains dominant.
-
-    Sentiment influence is deliberately limited so that a few
-    headlines cannot completely reverse the model prediction.
-    """
 
     p = float(
         np.clip(
@@ -341,8 +669,8 @@ def _sentiment_adjustment(
         )
     )
 
-    # No news -> no adjustment.
     if articles == 0:
+
         return {
             "raw_probability": p,
             "sentiment_score": 0.0,
@@ -352,19 +680,16 @@ def _sentiment_adjustment(
             "reason": "NO NEWS DATA",
         }
 
-    # Confidence in sentiment increases gradually with article count.
     article_confidence = min(
         1.0,
         articles / 10.0,
     )
 
-    # Sentiment weight is deliberately capped.
     sentiment_weight = (
         0.10
         * article_confidence
     )
 
-    # Convert [-1, +1] sentiment to [0, 1].
     sentiment_probability = (
         0.50
         + 0.50 * s
@@ -421,7 +746,7 @@ def _generate_signal(
     threshold: float,
 ) -> str:
 
-    probability_up = _safe_float(
+    p = _safe_float(
         probability_up,
         0.5,
     )
@@ -434,38 +759,20 @@ def _generate_signal(
         0.95,
     )
 
-    lower_threshold = (
-        1.0 - threshold
-    )
-
-    if probability_up >= threshold:
+    if p >= threshold:
         return "BUY"
 
-    if probability_up <= lower_threshold:
+    if p <= 1.0 - threshold:
         return "SELL"
 
     return "WAIT"
-
-
-# =====================================================================
-# AGREEMENT-AWARE SIGNAL
-# =====================================================================
 
 
 def _apply_agreement_filter(
     signal: str,
     probability_up: float,
     agreement: float,
-    sentiment_score: float,
 ) -> str:
-    """
-    Apply a conservative model-agreement filter.
-
-    Strong directional probability with severe model disagreement
-    becomes WAIT.
-
-    This is a risk-control mechanism, not a prediction guarantee.
-    """
 
     agreement = float(
         np.clip(
@@ -475,7 +782,7 @@ def _apply_agreement_filter(
         )
     )
 
-    probability_up = float(
+    p = float(
         np.clip(
             probability_up,
             0.0,
@@ -483,26 +790,28 @@ def _apply_agreement_filter(
         )
     )
 
-    # Strong disagreement.
     if agreement < 0.60:
 
-        # Allow only unusually strong evidence.
         if (
-            probability_up > 0.85
-            or probability_up < 0.15
+            p > 0.85
+            or p < 0.15
         ):
             return signal
 
         return "WAIT"
 
-    # Moderate agreement.
     if agreement < 0.80:
 
-        # Require slightly stronger directional probability.
-        if signal == "BUY" and probability_up < 0.65:
+        if (
+            signal == "BUY"
+            and p < 0.65
+        ):
             return "WAIT"
 
-        if signal == "SELL" and probability_up > 0.35:
+        if (
+            signal == "SELL"
+            and p > 0.35
+        ):
             return "WAIT"
 
     return signal
@@ -521,6 +830,7 @@ def _build_trade_plan(
 ) -> Dict[str, Any]:
 
     if current_price <= 0:
+
         return {
             "entry": None,
             "stop_loss": None,
@@ -622,29 +932,17 @@ def analyze_stock(
             "Input DataFrame is empty."
         )
 
-    horizon = int(horizon)
+    horizon = int(
+        horizon
+    )
 
     if horizon < 1:
         raise ValueError(
             "Prediction horizon must be >= 1."
         )
 
-    probability_threshold = float(
-        probability_threshold
-    )
-
-    if not (
-        0.50
-        <= probability_threshold
-        < 1.0
-    ):
-        raise ValueError(
-            "Probability threshold must be "
-            "between 0.50 and 0.99."
-        )
-
     # ================================================================
-    # FEATURES
+    # FEATURE ENGINEERING
     # ================================================================
 
     features = build_features(
@@ -695,19 +993,19 @@ def analyze_stock(
         0.5,
     )
 
-    probability_sum = (
+    total_probability = (
         probability_up
         + probability_down
     )
 
-    if probability_sum > 0:
+    if total_probability > 0:
 
         probability_up /= (
-            probability_sum
+            total_probability
         )
 
         probability_down /= (
-            probability_sum
+            total_probability
         )
 
     # ================================================================
@@ -746,6 +1044,54 @@ def analyze_stock(
         component_probabilities = {}
 
     # ================================================================
+    # MARKET CONTEXT
+    # ================================================================
+
+    market_context = (
+        _get_market_context()
+    )
+
+    # ================================================================
+    # SECTOR CONTEXT
+    # ================================================================
+
+    sector_context = (
+        _get_sector_context(
+            ticker
+        )
+    )
+
+    # ================================================================
+    # RELATIVE STRENGTH
+    # ================================================================
+
+    relative_strength = (
+        _calculate_relative_strength(
+            features,
+            market_context,
+        )
+    )
+
+    # ================================================================
+    # MARKET / SECTOR ADJUSTMENT
+    # ================================================================
+
+    context_fusion = (
+        _context_adjustment(
+            probability_up=probability_up,
+            market_context=market_context,
+            sector_context=sector_context,
+            relative_strength=relative_strength,
+        )
+    )
+
+    context_probability = (
+        context_fusion[
+            "adjusted_probability"
+        ]
+    )
+
+    # ================================================================
     # NEWS SENTIMENT
     # ================================================================
 
@@ -759,9 +1105,6 @@ def analyze_stock(
             "positive": 0,
             "neutral": 0,
             "negative": 0,
-            "positive_ratio": 0.0,
-            "negative_ratio": 0.0,
-            "sentiment_strength": 0.0,
         },
         "recent_score": 0.0,
     }
@@ -778,24 +1121,7 @@ def analyze_stock(
             )
 
         except Exception:
-
-            # News must never break price analysis.
-            sentiment_data = {
-                "ticker": ticker,
-                "news": pd.DataFrame(),
-                "summary": {
-                    "score": 0.0,
-                    "label": "UNAVAILABLE",
-                    "articles": 0,
-                    "positive": 0,
-                    "neutral": 0,
-                    "negative": 0,
-                    "positive_ratio": 0.0,
-                    "negative_ratio": 0.0,
-                    "sentiment_strength": 0.0,
-                },
-                "recent_score": 0.0,
-            }
+            pass
 
     sentiment_summary_data = (
         sentiment_data.get(
@@ -823,7 +1149,7 @@ def analyze_stock(
         or 0
     )
 
-    sentiment_label_value = (
+    sentiment_label_value = str(
         sentiment_summary_data.get(
             "label",
             "NO DATA",
@@ -832,44 +1158,47 @@ def analyze_stock(
 
     sentiment_fusion = (
         _sentiment_adjustment(
-            probability_up=probability_up,
-            sentiment_score=sentiment_score,
-            sentiment_articles=sentiment_articles,
+            probability_up=(
+                context_probability
+            ),
+            sentiment_score=(
+                sentiment_score
+            ),
+            sentiment_articles=(
+                sentiment_articles
+            ),
         )
     )
 
-    adjusted_probability = (
+    final_probability = (
         sentiment_fusion[
             "adjusted_probability"
         ]
     )
 
     # ================================================================
-    # BASE SIGNAL
+    # SIGNAL
     # ================================================================
 
     base_signal = _generate_signal(
-        adjusted_probability,
+        final_probability,
         probability_threshold,
     )
 
-    # ================================================================
-    # AGREEMENT FILTER
-    # ================================================================
-
-    final_signal = _apply_agreement_filter(
-        signal=base_signal,
-        probability_up=(
-            adjusted_probability
-        ),
-        agreement=_safe_float(
-            model_agreement.get(
-                "agreement",
+    final_signal = (
+        _apply_agreement_filter(
+            signal=base_signal,
+            probability_up=(
+                final_probability
+            ),
+            agreement=_safe_float(
+                model_agreement.get(
+                    "agreement",
+                    0.0,
+                ),
                 0.0,
             ),
-            0.0,
-        ),
-        sentiment_score=sentiment_score,
+        )
     )
 
     # ================================================================
@@ -877,8 +1206,8 @@ def analyze_stock(
     # ================================================================
 
     confidence = abs(
-        adjusted_probability
-        - (1.0 - adjusted_probability)
+        final_probability
+        - (1.0 - final_probability)
     )
 
     uncertainty = (
@@ -962,7 +1291,7 @@ def analyze_stock(
     )
 
     # ================================================================
-    # MARKET STRUCTURE
+    # STRUCTURE
     # ================================================================
 
     structure = (
@@ -1022,12 +1351,10 @@ def analyze_stock(
     # MODEL SUMMARY
     # ================================================================
 
-    model_summary = (
-        model.summary()
-    )
+    model_summary = model.summary()
 
     # ================================================================
-    # SENTIMENT NEWS TABLE
+    # NEWS
     # ================================================================
 
     news_df = sentiment_data.get(
@@ -1053,12 +1380,16 @@ def analyze_stock(
                 probability_down
             ),
 
-            "prediction_probability": float(
-                adjusted_probability
-            ),
-
             "prediction_probability_ml": float(
                 probability_up
+            ),
+
+            "prediction_probability_context": float(
+                context_probability
+            ),
+
+            "prediction_probability": float(
+                final_probability
             ),
 
             "prediction_probability_oos": float(
@@ -1086,6 +1417,20 @@ def analyze_stock(
             ),
 
             # --------------------------------------------------------
+            # MARKET CONTEXT
+            # --------------------------------------------------------
+
+            "market_context": market_context,
+
+            "sector_context": sector_context,
+
+            "relative_strength": (
+                relative_strength
+            ),
+
+            "context_fusion": context_fusion,
+
+            # --------------------------------------------------------
             # SENTIMENT
             # --------------------------------------------------------
 
@@ -1093,7 +1438,7 @@ def analyze_stock(
                 "score": float(
                     sentiment_score
                 ),
-                "label": str(
+                "label": (
                     sentiment_label_value
                 ),
                 "articles": int(
@@ -1150,7 +1495,7 @@ def analyze_stock(
             },
 
             # --------------------------------------------------------
-            # MODEL AGREEMENT
+            # MODEL
             # --------------------------------------------------------
 
             "model_agreement": (
@@ -1162,7 +1507,7 @@ def analyze_stock(
             ),
 
             # --------------------------------------------------------
-            # REGIME
+            # REGIME / MTF
             # --------------------------------------------------------
 
             "regime": regime,
@@ -1294,7 +1639,7 @@ def analyze_stock(
             },
 
             # --------------------------------------------------------
-            # FEATURES / MODEL
+            # MODEL DIAGNOSTICS
             # --------------------------------------------------------
 
             "top_features": (
@@ -1353,9 +1698,7 @@ def analyze_stock(
                 )
             ),
 
-            "model_summary": (
-                model_summary
-            ),
+            "model_summary": model_summary,
 
             "n_rows": int(
                 len(features)
