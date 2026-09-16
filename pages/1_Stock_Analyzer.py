@@ -12,6 +12,7 @@ Displays:
 - Multi-timeframe context
 - Risk / trade plan
 - Validation diagnostics
+- Probability reliability and calibration
 """
 
 from __future__ import annotations
@@ -1027,6 +1028,475 @@ if validation_brier is not None:
         f"Brier Score: **{float(validation_brier):.4f}** "
         "(lower indicates better probability calibration)"
     )
+
+
+
+# =====================================================================
+# PROBABILITY RELIABILITY HELPERS
+# =====================================================================
+
+def _extract_validation_probability_data(model):
+    """
+    Extract out-of-sample validation probabilities and actual labels
+    from the fitted classifier.
+
+    Multiple attribute names are supported so the UI remains compatible
+    with classifier revisions.
+    """
+    if model is None:
+        return None, None
+
+    probability_names = [
+        "validation_probabilities_",
+        "validation_probability_",
+        "validation_probs_",
+    ]
+
+    actual_names = [
+        "validation_actuals_",
+        "validation_actual_",
+        "validation_y_",
+        "validation_targets_",
+    ]
+
+    probabilities = None
+    actuals = None
+
+    for name in probability_names:
+        value = getattr(model, name, None)
+        if value is not None:
+            probabilities = value
+            break
+
+    for name in actual_names:
+        value = getattr(model, name, None)
+        if value is not None:
+            actuals = value
+            break
+
+    if probabilities is None or actuals is None:
+        return None, None
+
+    try:
+        probabilities = np.asarray(probabilities, dtype=float)
+        actuals = np.asarray(actuals, dtype=int).reshape(-1)
+
+        if probabilities.ndim == 2 and probabilities.shape[1] >= 2:
+            up_probability = probabilities[:, 1]
+            down_probability = probabilities[:, 0]
+        elif probabilities.ndim == 1:
+            up_probability = probabilities
+            down_probability = 1.0 - probabilities
+        else:
+            return None, None
+
+        n = min(
+            len(up_probability),
+            len(down_probability),
+            len(actuals),
+        )
+
+        if n == 0:
+            return None, None
+
+        frame = pd.DataFrame(
+            {
+                "probability_up": up_probability[:n],
+                "probability_down": down_probability[:n],
+                "actual": actuals[:n],
+            }
+        )
+
+        frame = frame.replace(
+            [np.inf, -np.inf],
+            np.nan,
+        ).dropna()
+
+        frame["actual"] = (
+            pd.to_numeric(
+                frame["actual"],
+                errors="coerce",
+            )
+            .round()
+            .astype("Int64")
+        )
+
+        frame = frame[
+            frame["actual"].isin([0, 1])
+        ].copy()
+
+        if frame.empty:
+            return None, None
+
+        frame["confidence"] = frame[
+            [
+                "probability_up",
+                "probability_down",
+            ]
+        ].max(axis=1)
+
+        frame["predicted_class"] = (
+            frame["probability_up"] >= 0.50
+        ).astype(int)
+
+        frame["correct"] = (
+            frame["predicted_class"]
+            == frame["actual"].astype(int)
+        )
+
+        frame["confidence"] = frame[
+            "confidence"
+        ].clip(0.0, 1.0)
+
+        return frame, None
+
+    except Exception:
+        return None, None
+
+
+def _build_confidence_calibration(validation_frame):
+    """
+    Build confidence buckets for both bullish and bearish predictions.
+    """
+    if (
+        validation_frame is None
+        or validation_frame.empty
+    ):
+        return pd.DataFrame()
+
+    bins = [
+        0.50,
+        0.60,
+        0.70,
+        0.80,
+        0.90,
+        1.00,
+    ]
+
+    labels = [
+        "50–60%",
+        "60–70%",
+        "70–80%",
+        "80–90%",
+        "90–100%",
+    ]
+
+    work = validation_frame.copy()
+
+    work["bucket"] = pd.cut(
+        work["confidence"],
+        bins=bins,
+        labels=labels,
+        include_lowest=True,
+        right=True,
+    )
+
+    rows = []
+
+    for label in labels:
+        subset = work[
+            work["bucket"] == label
+        ]
+
+        if subset.empty:
+            continue
+
+        predicted_confidence = float(
+            subset["confidence"].mean()
+        )
+
+        observed_accuracy = float(
+            subset["correct"].mean()
+        )
+
+        rows.append(
+            {
+                "Confidence Bucket": label,
+                "Samples": int(len(subset)),
+                "Mean Model Confidence": predicted_confidence,
+                "Observed Accuracy": observed_accuracy,
+                "Calibration Gap": (
+                    observed_accuracy
+                    - predicted_confidence
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+# =====================================================================
+# PROBABILITY RELIABILITY DASHBOARD
+# =====================================================================
+
+st.subheader(
+    "🎯 Probability Reliability"
+)
+
+reliability_model = result.get(
+    "model"
+)
+
+validation_frame, _ = (
+    _extract_validation_probability_data(
+        reliability_model
+    )
+)
+
+if (
+    validation_frame is None
+    or validation_frame.empty
+):
+    st.info(
+        "Historical validation probabilities are not exposed "
+        "by the current classifier, so the 90% reliability test "
+        "cannot be calculated yet."
+    )
+    st.caption(
+        "This dashboard deliberately does not manufacture a "
+        "90% probability from accuracy or other summary metrics."
+    )
+
+else:
+    calibration_df = (
+        _build_confidence_calibration(
+            validation_frame
+        )
+    )
+
+    high_confidence = validation_frame[
+        validation_frame["confidence"] >= 0.90
+    ]
+
+    validation_samples = len(
+        validation_frame
+    )
+
+    high_confidence_samples = len(
+        high_confidence
+    )
+
+    if high_confidence_samples > 0:
+        high_confidence_accuracy = float(
+            high_confidence["correct"].mean()
+        )
+        high_confidence_mean = float(
+            high_confidence["confidence"].mean()
+        )
+    else:
+        high_confidence_accuracy = np.nan
+        high_confidence_mean = np.nan
+
+    # Expected Calibration Error using confidence buckets.
+    if not calibration_df.empty:
+        calibration_df["_weight"] = (
+            calibration_df["Samples"]
+            / validation_samples
+        )
+        ece = float(
+            (
+                calibration_df["Calibration Gap"].abs()
+                * calibration_df["_weight"]
+            ).sum()
+        )
+        calibration_df = calibration_df.drop(
+            columns=["_weight"]
+        )
+    else:
+        ece = np.nan
+
+    r1, r2, r3, r4 = st.columns(4)
+
+    with r1:
+        st.metric(
+            "Validation Samples",
+            f"{validation_samples:,}",
+        )
+
+    with r2:
+        if np.isfinite(high_confidence_mean):
+            st.metric(
+                "Current 90% Gate",
+                (
+                    "PASS"
+                    if max(
+                        probability_up,
+                        probability_down,
+                    ) >= 0.90
+                    else "NOT REACHED"
+                ),
+            )
+        else:
+            st.metric(
+                "Current 90% Gate",
+                "NO DATA",
+            )
+
+    with r3:
+        if np.isfinite(
+            high_confidence_accuracy
+        ):
+            st.metric(
+                "Observed Accuracy ≥90%",
+                f"{high_confidence_accuracy:.1%}",
+            )
+        else:
+            st.metric(
+                "Observed Accuracy ≥90%",
+                "No samples",
+            )
+
+    with r4:
+        if np.isfinite(ece):
+            st.metric(
+                "Confidence ECE",
+                f"{ece:.3f}",
+            )
+        else:
+            st.metric(
+                "Confidence ECE",
+                "N/A",
+            )
+
+    st.caption(
+        "The ≥90% figure is a validation bucket, not a forced "
+        "model output. Its observed accuracy is calculated only "
+        "from historical validation predictions."
+    )
+
+    if high_confidence_samples > 0:
+        st.write(
+            f"**≥90% confidence validation sample:** "
+            f"{high_confidence_samples:,} observations"
+        )
+    else:
+        st.write(
+            "**≥90% confidence validation sample:** "
+            "No observations in the current validation split."
+        )
+
+    if not calibration_df.empty:
+        display_calibration = calibration_df.copy()
+
+        display_calibration[
+            "Mean Model Confidence"
+        ] = display_calibration[
+            "Mean Model Confidence"
+        ].map(
+            lambda x: f"{x:.1%}"
+        )
+
+        display_calibration[
+            "Observed Accuracy"
+        ] = display_calibration[
+            "Observed Accuracy"
+        ].map(
+            lambda x: f"{x:.1%}"
+        )
+
+        display_calibration[
+            "Calibration Gap"
+        ] = display_calibration[
+            "Calibration Gap"
+        ].map(
+            lambda x: f"{x:+.1%}"
+        )
+
+        with st.expander(
+            "View Probability Calibration Table",
+            expanded=True,
+        ):
+            st.dataframe(
+                display_calibration,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        chart = go.Figure()
+
+        chart.add_trace(
+            go.Scatter(
+                x=calibration_df[
+                    "Mean Model Confidence"
+                ],
+                y=calibration_df[
+                    "Observed Accuracy"
+                ],
+                mode="lines+markers",
+                name="Observed",
+            )
+        )
+
+        chart.add_trace(
+            go.Scatter(
+                x=[0.50, 1.00],
+                y=[0.50, 1.00],
+                mode="lines",
+                name="Perfect Calibration",
+                line=dict(
+                    dash="dash"
+                ),
+            )
+        )
+
+        chart.update_layout(
+            title="Confidence Calibration",
+            xaxis_title="Mean Model Confidence",
+            yaxis_title="Observed Accuracy",
+            xaxis=dict(
+                range=[0.50, 1.00],
+                tickformat=".0%",
+            ),
+            yaxis=dict(
+                range=[0.50, 1.00],
+                tickformat=".0%",
+            ),
+            height=420,
+            margin=dict(
+                l=20,
+                r=20,
+                t=50,
+                b=20,
+            ),
+        )
+
+        st.plotly_chart(
+            chart,
+            use_container_width=True,
+        )
+
+    # Explicit current probability interpretation.
+    current_confidence = max(
+        probability_up,
+        probability_down,
+    )
+
+    if current_confidence >= 0.90:
+        st.success(
+            f"Current ensemble confidence is "
+            f"**{current_confidence:.1%}**. "
+            "This qualifies for the ≥90% confidence bucket."
+        )
+    elif current_confidence >= 0.80:
+        st.warning(
+            f"Current ensemble confidence is "
+            f"**{current_confidence:.1%}**. "
+            "It has not reached the ≥90% high-confidence gate."
+        )
+    else:
+        st.info(
+            f"Current ensemble confidence is "
+            f"**{current_confidence:.1%}**. "
+            "The model is not presenting this setup as a ≥90% "
+            "confidence prediction."
+        )
+
+    st.caption(
+        "Calibration gap = observed accuracy − mean model confidence. "
+        "A negative gap means the model was overconfident in that bucket; "
+        "a positive gap means it was underconfident."
+    )
+
 
 
 # =====================================================================
